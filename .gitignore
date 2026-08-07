@@ -1,0 +1,5 @@
+build/
+addons/TargetLines/data/
+addons/TargetLines/*.log
+src/plugin/build/
+src/plugin/*.dll
