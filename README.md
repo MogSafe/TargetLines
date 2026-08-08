@@ -128,7 +128,7 @@ https://github.com/user-attachments/assets/d91f9572-b2b1-411f-b94f-7ac4855fa7c4
 Default colors:
 
 - Blue: player, party, trust, or pet actions against enemies.
-- Green: friendly support actions between party/trust/player targets.
+- Green: friendly support actions within your party/trust group.
 - Red: enemy actions targeting the player, party, trusts, or pets.
 - Magenta: enemy-to-enemy actions.
 
