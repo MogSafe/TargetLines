@@ -1,6 +1,6 @@
 _addon.name = 'TargetLines'
 _addon.author = 'MogSafe'
-_addon.version = '1.0.0'
+_addon.version = '1.0.2'
 _addon.commands = {'targetlines', 'tl'}
 
 config = require('config')
