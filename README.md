@@ -46,6 +46,19 @@ plugins\TargetLines.dll
 If the extracted folder is named something like `TargetLines-main`, copy the
 contents from inside that folder rather than loading it directly.
 
+## Repository Layout
+
+```text
+addons/TargetLines/        Runtime Lua addon. Handles packets, settings, and line state.
+plugins/TargetLines.dll    Runtime native plugin. Draws lines in the 3D scene.
+src/plugin/                Native plugin source. Only needed for development or rebuilds.
+```
+
+For normal installation, **COPY ONLY**:
+
+- `addons/TargetLines`
+- `plugins/TargetLines.dll`
+
 ### Loading
 
 Load both parts in-game:
