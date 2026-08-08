@@ -1000,6 +1000,35 @@ local function add_recent_line(source, target, kind, color, timeout, options)
     return true, key
 end
 
+local function active_entity_ids(party)
+    local ids = {}
+    for key in pairs(party or {}) do
+        if type(key) == 'number' then
+            ids[key] = true
+        end
+    end
+
+    for _, mob in pairs(get_mobs()) do
+        if is_visible_entity(mob) then
+            ids[mob.id] = true
+        end
+    end
+
+    return ids
+end
+
+local function prune_seen_pairs_for_inactive_entities(party)
+    local active_ids = active_entity_ids(party)
+    for key in pairs(seen_pairs) do
+        local source_id, target_id = key:match('^(%d+)>(%d+)$')
+        source_id = tonumber(source_id)
+        target_id = tonumber(target_id)
+        if not source_id or not target_id or not active_ids[source_id] or not active_ids[target_id] then
+            seen_pairs[key] = nil
+        end
+    end
+end
+
 local function handle_action_packet(packet)
     if not packet then
         return
@@ -1320,7 +1349,10 @@ local function collect_lines()
         end)
     end
 
-    if regular_mode() == 'repeat' then
+    local regular = regular_mode()
+    if regular == 'first' then
+        prune_seen_pairs_for_inactive_entities(party)
+    elseif regular == 'repeat' then
         local cooldown = tonumber(settings.pair_cooldown) or defaults.pair_cooldown
         for key, last_seen in pairs(seen_pairs) do
             if now - last_seen > cooldown then
