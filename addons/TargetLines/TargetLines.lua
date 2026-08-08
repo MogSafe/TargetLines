@@ -90,7 +90,8 @@ config_box.current_string = ''
 config_box:hide()
 local config_visible = false
 
-local state_path = windower.windower_path .. 'plugins/settings/TargetLines/lines.json'
+local state_dir = windower.windower_path .. 'plugins/settings/TargetLines'
+local state_path = state_dir .. '/lines.json'
 local inspect_path = windower.addon_path .. 'inspect.log'
 local runtime_log_path = windower.addon_path .. 'runtime.log'
 local last_write = 0
@@ -126,6 +127,13 @@ local native_probe_commands = {
     drawon = true,
     drawoff = true,
 }
+
+local function ensure_state_dir()
+    if type(windower.create_dir) == 'function' then
+        windower.create_dir(windower.windower_path .. 'plugins/settings')
+        windower.create_dir(state_dir)
+    end
+end
 
 local slider_rows = {
     {name = 'opacity_scale', command = 'opacity', label = 'opacity'},
@@ -1456,6 +1464,7 @@ local function write_state(lines)
         return
     end
 
+    ensure_state_dir()
     local file = io.open(state_path, 'w')
     if not file then
         warning('Could not write ' .. state_path)
@@ -1517,6 +1526,7 @@ windower.register_event('prerender', function()
 end)
 
 windower.register_event('load', function()
+    ensure_state_dir()
     append_runtime_log('loaded enabled=' .. tostring(settings.enabled) .. ' debug=' .. tostring(settings.debug))
 end)
 
