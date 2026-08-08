@@ -1,0 +1,4 @@
+LIBRARY "TargetLines"
+EXPORTS
+    GetInterfaceVersion
+    CreateInstance
