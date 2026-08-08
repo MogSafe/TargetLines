@@ -130,7 +130,7 @@ Default colors:
 - Blue: player, party, trust, or pet actions against enemies.
 - Green: friendly support actions within your party/trust group.
 - Red: enemy actions targeting the player, party, trusts, or pets.
-- Magenta: enemy-to-enemy actions.
+- Magenta: NPC-to-NPC actions, such as enemy-to-enemy actions or other players' trusts.
 
 Color blind mode uses:
 
