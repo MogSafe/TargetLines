@@ -150,7 +150,7 @@ Color blind mode uses:
 - Cyan/blue: player actions.
 - Yellow/gold: friendly support actions.
 - Vermilion: enemy actions.
-- Magenta/pink: enemy-to-enemy actions.
+- Magenta/pink: NPC-to-NPC/enemy-to-enemy actions.
 
 ## Settings
 
