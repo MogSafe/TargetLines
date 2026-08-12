@@ -853,6 +853,7 @@ private:
             return;
         }
 
+        begin_line_batch();
         const DWORD now_ms = GetTickCount();
         for (int i = 0; i < line_count; ++i) {
             ActiveLine* active = nullptr;
@@ -867,11 +868,10 @@ private:
 
             const bool spread_source = active && active->spread_source;
             const bool spread_target = active && active->spread_target;
-            begin_line_batch();
             draw_line_curve(lines[i], viewport, mob_array, spread_source, spread_target, progress, arc_settle, settle, tail, color);
-            end_line_batch();
         }
 
+        end_line_batch();
         end_draw_state();
         prune_active_lines(now_ms);
     }
@@ -2577,7 +2577,7 @@ private:
     DWORD saved_cull_ = 0;
     IDirect3DBaseTexture8* saved_texture_ = nullptr;
     bool draw_state_active_ = false;
-    static constexpr int max_line_batch_vertices_ = 1400;
+    static constexpr int max_line_batch_vertices_ = 32760;
     DrawVertex line_batch_vertices_[max_line_batch_vertices_] {};
     int line_batch_vertex_count_ = 0;
     bool line_batch_active_ = false;
