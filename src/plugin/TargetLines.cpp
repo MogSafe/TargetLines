@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <d3d8.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cmath>
 #include <ctime>
@@ -79,6 +80,7 @@ public:
 
     void __stdcall Load(PluginManager* manager) override {
         plugin_manager_ = manager;
+        QueryPerformanceFrequency(&performance_frequency_);
         append_module_log("Load called");
         initialize_paths_from_module();
         append_log("loaded");
@@ -270,6 +272,17 @@ public:
     }
 
     void __stdcall PostRender() override {
+        LARGE_INTEGER frame_counter {};
+        QueryPerformanceCounter(&frame_counter);
+        const float frame_ms = previous_postrender_counter_ > 0
+            ? counter_milliseconds(frame_counter.QuadPart - previous_postrender_counter_)
+            : 0.0f;
+        previous_postrender_counter_ = frame_counter.QuadPart;
+        benchmark_current_projections_ = 0;
+        benchmark_current_draw_calls_ = 0;
+        benchmark_current_state_reads_ = 0;
+        projection_matrices_valid_ = false;
+
         ++postrender_calls_;
 
         if (postrender_calls_ == 1 || (postrender_calls_ % 300) == 0) {
@@ -284,7 +297,15 @@ public:
         }
 
         if (overlay_enabled_) {
+            LARGE_INTEGER overlay_start {};
+            LARGE_INTEGER overlay_end {};
+            QueryPerformanceCounter(&overlay_start);
             draw_lines();
+            QueryPerformanceCounter(&overlay_end);
+            if (benchmark_enabled_) {
+                record_benchmark_sample(frame_ms,
+                    counter_milliseconds(overlay_end.QuadPart - overlay_start.QuadPart));
+            }
         }
 
         if (matrix_probe_pending_) {
@@ -797,8 +818,8 @@ private:
     };
 
     void draw_lines() {
-        LineState lines[16] {};
-        const int line_count = read_lines(lines, 16);
+        LineState lines[128] {};
+        const int line_count = read_lines(lines, 128);
         if (line_count <= 0) {
             return;
         }
@@ -815,7 +836,10 @@ private:
         }
 
         D3DVIEWPORT8 viewport {};
-        if (!d3d_device_ || FAILED(d3d_device_->GetViewport(&viewport))) {
+        if (!refresh_projection_matrices()) {
+            return;
+        }
+        if (FAILED(d3d_device_->GetViewport(&viewport))) {
             viewport.Width = 1024;
             viewport.Height = 768;
         }
@@ -823,6 +847,10 @@ private:
         std::uintptr_t mob_array = 0;
         if (dynamic_bone_ >= 0) {
             get_luacore_mob_array(mob_array, nullptr, nullptr);
+        }
+
+        if (!begin_draw_state()) {
+            return;
         }
 
         const DWORD now_ms = GetTickCount();
@@ -839,9 +867,12 @@ private:
 
             const bool spread_source = active && active->spread_source;
             const bool spread_target = active && active->spread_target;
+            begin_line_batch();
             draw_line_curve(lines[i], viewport, mob_array, spread_source, spread_target, progress, arc_settle, settle, tail, color);
+            end_line_batch();
         }
 
+        end_draw_state();
         prune_active_lines(now_ms);
     }
 
@@ -1849,22 +1880,168 @@ private:
         return {base, base + size};
     }
 
-    int read_lines(LineState* lines, int max_lines) {
-        FILE* file = std::fopen(state_path_, "rb");
-        if (!file) {
+    float counter_milliseconds(LONGLONG ticks) const {
+        if (performance_frequency_.QuadPart <= 0) {
+            return 0.0f;
+        }
+
+        return static_cast<float>(static_cast<double>(ticks) * 1000.0
+            / static_cast<double>(performance_frequency_.QuadPart));
+    }
+
+    void reset_benchmark_samples(DWORD now_ms) {
+        benchmark_sample_count_ = 0;
+        benchmark_projection_total_ = 0;
+        benchmark_draw_call_total_ = 0;
+        benchmark_state_read_total_ = 0;
+        benchmark_last_report_ms_ = now_ms;
+    }
+
+    void set_benchmark_state(bool enabled, int line_count) {
+        line_count = std::max(0, std::min(line_count, 128));
+        if (benchmark_enabled_ == enabled && benchmark_line_count_ == line_count) {
+            return;
+        }
+
+        benchmark_enabled_ = enabled;
+        benchmark_line_count_ = enabled ? line_count : 0;
+        benchmark_skip_next_sample_ = true;
+        reset_benchmark_samples(GetTickCount());
+    }
+
+    int benchmark_percentile_index(int count, float percentile) const {
+        if (count <= 1) {
             return 0;
         }
 
-        char buffer[32768] {};
+        const int index = static_cast<int>(std::ceil(percentile * static_cast<float>(count))) - 1;
+        return std::max(0, std::min(index, count - 1));
+    }
+
+    void write_benchmark_report() {
+        if (benchmark_path_[0] == '\0' || benchmark_sample_count_ <= 0) {
+            return;
+        }
+
+        float frame_sorted[benchmark_max_samples_] {};
+        float overlay_sorted[benchmark_max_samples_] {};
+        float frame_total = 0.0f;
+        float overlay_total = 0.0f;
+        for (int i = 0; i < benchmark_sample_count_; ++i) {
+            frame_sorted[i] = benchmark_frame_samples_[i];
+            overlay_sorted[i] = benchmark_overlay_samples_[i];
+            frame_total += benchmark_frame_samples_[i];
+            overlay_total += benchmark_overlay_samples_[i];
+        }
+        std::sort(frame_sorted, frame_sorted + benchmark_sample_count_);
+        std::sort(overlay_sorted, overlay_sorted + benchmark_sample_count_);
+
+        const float frame_average = frame_total / static_cast<float>(benchmark_sample_count_);
+        const float overlay_average = overlay_total / static_cast<float>(benchmark_sample_count_);
+        const int p95 = benchmark_percentile_index(benchmark_sample_count_, 0.95f);
+        const int p99 = benchmark_percentile_index(benchmark_sample_count_, 0.99f);
+        const float sample_scale = 1.0f / static_cast<float>(benchmark_sample_count_);
+
+        FILE* file = std::fopen(benchmark_path_, "wb");
+        if (!file) {
+            return;
+        }
+
+        std::fprintf(file,
+            "{\"lines\":%d,\"samples\":%d,\"fps\":%.3f,"
+            "\"frame_avg_ms\":%.3f,\"frame_p95_ms\":%.3f,\"frame_p99_ms\":%.3f,\"frame_max_ms\":%.3f,"
+            "\"overlay_avg_ms\":%.3f,\"overlay_p95_ms\":%.3f,\"overlay_p99_ms\":%.3f,\"overlay_max_ms\":%.3f,"
+            "\"projections_per_frame\":%.3f,\"draw_calls_per_frame\":%.3f,\"state_reads_per_frame\":%.3f}\n",
+            benchmark_line_count_, benchmark_sample_count_, frame_average > 0.0f ? 1000.0f / frame_average : 0.0f,
+            frame_average, frame_sorted[p95], frame_sorted[p99], frame_sorted[benchmark_sample_count_ - 1],
+            overlay_average, overlay_sorted[p95], overlay_sorted[p99], overlay_sorted[benchmark_sample_count_ - 1],
+            static_cast<float>(benchmark_projection_total_) * sample_scale,
+            static_cast<float>(benchmark_draw_call_total_) * sample_scale,
+            static_cast<float>(benchmark_state_read_total_) * sample_scale);
+        std::fclose(file);
+    }
+
+    void record_benchmark_sample(float frame_ms, float overlay_ms) {
+        const DWORD now_ms = GetTickCount();
+        if (benchmark_skip_next_sample_) {
+            benchmark_skip_next_sample_ = false;
+            return;
+        }
+        if (frame_ms <= 0.0f || overlay_ms < 0.0f) {
+            return;
+        }
+
+        if (benchmark_sample_count_ >= benchmark_max_samples_) {
+            write_benchmark_report();
+            reset_benchmark_samples(now_ms);
+        }
+
+        benchmark_frame_samples_[benchmark_sample_count_] = frame_ms;
+        benchmark_overlay_samples_[benchmark_sample_count_] = overlay_ms;
+        ++benchmark_sample_count_;
+        benchmark_projection_total_ += benchmark_current_projections_;
+        benchmark_draw_call_total_ += benchmark_current_draw_calls_;
+        benchmark_state_read_total_ += benchmark_current_state_reads_;
+
+        if (benchmark_sample_count_ >= 30 && now_ms - benchmark_last_report_ms_ >= 2000) {
+            write_benchmark_report();
+            reset_benchmark_samples(now_ms);
+            benchmark_skip_next_sample_ = true;
+        }
+    }
+
+    int read_lines(LineState* lines, int max_lines) {
+        WIN32_FILE_ATTRIBUTE_DATA attributes_before {};
+        if (!GetFileAttributesExA(state_path_, GetFileExInfoStandard, &attributes_before)) {
+            state_cache_valid_ = false;
+            set_benchmark_state(false, 0);
+            return 0;
+        }
+
+        ULARGE_INTEGER write_time_before {};
+        write_time_before.LowPart = attributes_before.ftLastWriteTime.dwLowDateTime;
+        write_time_before.HighPart = attributes_before.ftLastWriteTime.dwHighDateTime;
+        const unsigned long long file_size_before =
+            (static_cast<unsigned long long>(attributes_before.nFileSizeHigh) << 32)
+            | attributes_before.nFileSizeLow;
+
+        if (state_cache_valid_
+            && cached_state_write_time_ == write_time_before.QuadPart
+            && cached_state_file_size_ == file_size_before) {
+            return copy_cached_lines(lines, max_lines);
+        }
+
+        FILE* file = std::fopen(state_path_, "rb");
+        if (!file) {
+            return state_cache_valid_ ? copy_cached_lines(lines, max_lines) : 0;
+        }
+
+        ++benchmark_current_state_reads_;
+        char buffer[131072] {};
         const std::size_t read = std::fread(buffer, 1, sizeof(buffer) - 1, file);
         std::fclose(file);
         buffer[read] = '\0';
 
-        if (std::strstr(buffer, "\"source\"") == nullptr) {
-            return 0;
+        std::size_t content_end = read;
+        while (content_end > 0 && (buffer[content_end - 1] == ' ' || buffer[content_end - 1] == '\t'
+            || buffer[content_end - 1] == '\r' || buffer[content_end - 1] == '\n')) {
+            --content_end;
+        }
+        if (file_size_before >= sizeof(buffer) || content_end == 0 || buffer[0] != '{'
+            || buffer[content_end - 1] != '}') {
+            return state_cache_valid_ ? copy_cached_lines(lines, max_lines) : 0;
         }
 
-        const char* settings = std::strstr(buffer, "\"settings\"");
+        const char* benchmark = std::strstr(buffer, "\"benchmark\"");
+        const bool benchmark_enabled = benchmark && parse_json_bool(benchmark, "\"enabled\"");
+        const int benchmark_lines = benchmark
+            ? static_cast<int>(parse_json_uint(benchmark, "\"lines\""))
+            : 0;
+        set_benchmark_state(benchmark_enabled, benchmark_lines);
+
+        const bool has_lines = std::strstr(buffer, "\"source\"") != nullptr;
+
+        const char* settings = has_lines ? std::strstr(buffer, "\"settings\"") : nullptr;
         if (settings) {
             const float opacity = parse_json_float(settings, "\"opacity\"");
             if (opacity >= 0.0f && opacity <= 1.0f) {
@@ -1889,19 +2066,50 @@ private:
         }
         boneprobe_requested_ = std::strstr(buffer, "\"boneprobe\":true") != nullptr;
 
+        LineState parsed_lines[128] {};
         int count = 0;
-        const char* lines_array = std::strstr(buffer, "\"lines\"");
+        const int render_limit = benchmark_enabled_ ? max_lines : std::min(max_lines, 16);
+        const char* lines_array = has_lines ? std::strstr(buffer, "\"lines\"") : nullptr;
         if (lines_array) {
-            count = parse_line_array(lines_array, lines, max_lines);
+            count = parse_line_array(lines_array, parsed_lines, render_limit);
         }
 
         if (count == 0) {
             const char* probe_lines_array = std::strstr(buffer, "\"probe_lines\"");
             if (probe_lines_array) {
-                count = parse_line_array(probe_lines_array, lines, max_lines);
+                count = parse_line_array(probe_lines_array, parsed_lines, render_limit);
             }
         }
 
+        cached_line_count_ = std::min(count, 128);
+        for (int i = 0; i < cached_line_count_; ++i) {
+            cached_lines_[i] = parsed_lines[i];
+        }
+        state_cache_valid_ = true;
+
+        WIN32_FILE_ATTRIBUTE_DATA attributes_after {};
+        if (GetFileAttributesExA(state_path_, GetFileExInfoStandard, &attributes_after)) {
+            ULARGE_INTEGER write_time_after {};
+            write_time_after.LowPart = attributes_after.ftLastWriteTime.dwLowDateTime;
+            write_time_after.HighPart = attributes_after.ftLastWriteTime.dwHighDateTime;
+            const unsigned long long file_size_after =
+                (static_cast<unsigned long long>(attributes_after.nFileSizeHigh) << 32)
+                | attributes_after.nFileSizeLow;
+            if (write_time_after.QuadPart == write_time_before.QuadPart
+                && file_size_after == file_size_before) {
+                cached_state_write_time_ = write_time_after.QuadPart;
+                cached_state_file_size_ = file_size_after;
+            }
+        }
+
+        return copy_cached_lines(lines, max_lines);
+    }
+
+    int copy_cached_lines(LineState* lines, int max_lines) const {
+        const int count = std::min(cached_line_count_, max_lines);
+        for (int i = 0; i < count; ++i) {
+            lines[i] = cached_lines_[i];
+        }
         return count;
     }
 
@@ -2013,17 +2221,31 @@ private:
         return std::strncmp(colon, "true", 4) == 0;
     }
 
-    bool live_world_to_screen(float lua_x, float lua_y, float lua_z, const D3DVIEWPORT8& viewport, float& screen_x, float& screen_y) {
+    bool refresh_projection_matrices() {
         if (!d3d_device_) {
             return false;
         }
 
-        D3DMATRIX view {};
-        D3DMATRIX projection {};
-        if (FAILED(d3d_device_->GetTransform(D3DTS_VIEW, &view)) ||
-            FAILED(d3d_device_->GetTransform(D3DTS_PROJECTION, &projection))) {
+        if (FAILED(d3d_device_->GetTransform(D3DTS_VIEW, &cached_view_)) ||
+            FAILED(d3d_device_->GetTransform(D3DTS_PROJECTION, &cached_projection_))) {
+            projection_matrices_valid_ = false;
             return false;
         }
+
+        projection_matrices_valid_ = true;
+        return true;
+    }
+
+    bool live_world_to_screen(float lua_x, float lua_y, float lua_z, const D3DVIEWPORT8& viewport, float& screen_x, float& screen_y) {
+        if (benchmark_enabled_) {
+            ++benchmark_current_projections_;
+        }
+        if (!projection_matrices_valid_) {
+            return false;
+        }
+
+        const D3DMATRIX& view = cached_view_;
+        const D3DMATRIX& projection = cached_projection_;
 
         // FFXI Lua positions use x/y as ground-plane coordinates and z as height.
         // D3D's observed model translations map those to x/z ground-plane and y height.
@@ -2148,32 +2370,28 @@ private:
         }
     }
 
-    void draw_vertices(D3DPRIMITIVETYPE primitive_type, UINT primitive_count, const DrawVertex* vertices, UINT stride) {
+    bool begin_draw_state() {
+        if (draw_state_active_) {
+            return true;
+        }
+
         if (!d3d_device_) {
             probe_device("draw");
         }
 
         if (!d3d_device_) {
-            return;
+            return false;
         }
 
-        DWORD old_shader = 0;
-        DWORD old_alpha = 0;
-        DWORD old_src = 0;
-        DWORD old_dest = 0;
-        DWORD old_z = 0;
-        DWORD old_lighting = 0;
-        DWORD old_cull = 0;
-        IDirect3DBaseTexture8* old_texture = nullptr;
-
-        d3d_device_->GetVertexShader(&old_shader);
-        d3d_device_->GetRenderState(D3DRS_ALPHABLENDENABLE, &old_alpha);
-        d3d_device_->GetRenderState(D3DRS_SRCBLEND, &old_src);
-        d3d_device_->GetRenderState(D3DRS_DESTBLEND, &old_dest);
-        d3d_device_->GetRenderState(D3DRS_ZENABLE, &old_z);
-        d3d_device_->GetRenderState(D3DRS_LIGHTING, &old_lighting);
-        d3d_device_->GetRenderState(D3DRS_CULLMODE, &old_cull);
-        d3d_device_->GetTexture(0, &old_texture);
+        saved_texture_ = nullptr;
+        d3d_device_->GetVertexShader(&saved_shader_);
+        d3d_device_->GetRenderState(D3DRS_ALPHABLENDENABLE, &saved_alpha_);
+        d3d_device_->GetRenderState(D3DRS_SRCBLEND, &saved_src_);
+        d3d_device_->GetRenderState(D3DRS_DESTBLEND, &saved_dest_);
+        d3d_device_->GetRenderState(D3DRS_ZENABLE, &saved_z_);
+        d3d_device_->GetRenderState(D3DRS_LIGHTING, &saved_lighting_);
+        d3d_device_->GetRenderState(D3DRS_CULLMODE, &saved_cull_);
+        d3d_device_->GetTexture(0, &saved_texture_);
 
         d3d_device_->SetTexture(0, nullptr);
         d3d_device_->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
@@ -2183,19 +2401,87 @@ private:
         d3d_device_->SetRenderState(D3DRS_LIGHTING, FALSE);
         d3d_device_->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
         d3d_device_->SetVertexShader(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+
+        draw_state_active_ = true;
+        return true;
+    }
+
+    void end_draw_state() {
+        if (!draw_state_active_ || !d3d_device_) {
+            return;
+        }
+
+        d3d_device_->SetTexture(0, saved_texture_);
+        if (saved_texture_) {
+            saved_texture_->Release();
+            saved_texture_ = nullptr;
+        }
+        d3d_device_->SetRenderState(D3DRS_ALPHABLENDENABLE, saved_alpha_);
+        d3d_device_->SetRenderState(D3DRS_SRCBLEND, saved_src_);
+        d3d_device_->SetRenderState(D3DRS_DESTBLEND, saved_dest_);
+        d3d_device_->SetRenderState(D3DRS_ZENABLE, saved_z_);
+        d3d_device_->SetRenderState(D3DRS_LIGHTING, saved_lighting_);
+        d3d_device_->SetRenderState(D3DRS_CULLMODE, saved_cull_);
+        d3d_device_->SetVertexShader(saved_shader_);
+        draw_state_active_ = false;
+    }
+
+    void begin_line_batch() {
+        line_batch_vertex_count_ = 0;
+        line_batch_active_ = true;
+    }
+
+    void flush_line_batch() {
+        if (line_batch_vertex_count_ <= 0) {
+            return;
+        }
+
+        submit_vertices(D3DPT_TRIANGLELIST, static_cast<UINT>(line_batch_vertex_count_ / 3),
+            line_batch_vertices_, sizeof(DrawVertex));
+        line_batch_vertex_count_ = 0;
+    }
+
+    void end_line_batch() {
+        flush_line_batch();
+        line_batch_active_ = false;
+    }
+
+    void draw_vertices(D3DPRIMITIVETYPE primitive_type, UINT primitive_count, const DrawVertex* vertices, UINT stride) {
+        if (line_batch_active_ && primitive_type == D3DPT_TRIANGLELIST && stride == sizeof(DrawVertex)) {
+            const UINT vertex_count = primitive_count * 3;
+            if (vertex_count > static_cast<UINT>(max_line_batch_vertices_)) {
+                flush_line_batch();
+                submit_vertices(primitive_type, primitive_count, vertices, stride);
+                return;
+            }
+
+            if (line_batch_vertex_count_ + static_cast<int>(vertex_count) > max_line_batch_vertices_) {
+                flush_line_batch();
+            }
+            std::memcpy(line_batch_vertices_ + line_batch_vertex_count_, vertices,
+                static_cast<std::size_t>(vertex_count) * sizeof(DrawVertex));
+            line_batch_vertex_count_ += static_cast<int>(vertex_count);
+            return;
+        }
+
+        submit_vertices(primitive_type, primitive_count, vertices, stride);
+    }
+
+    void submit_vertices(D3DPRIMITIVETYPE primitive_type, UINT primitive_count, const DrawVertex* vertices, UINT stride) {
+        if (benchmark_enabled_) {
+            ++benchmark_current_draw_calls_;
+        }
+
+        const bool owns_draw_state = !draw_state_active_;
+        if (owns_draw_state && !begin_draw_state()) {
+            return;
+        }
+
         d3d_device_->DrawPrimitiveUP(primitive_type, primitive_count, vertices, stride);
 
-        d3d_device_->SetTexture(0, old_texture);
-        if (old_texture) {
-            old_texture->Release();
+        if (owns_draw_state) {
+            end_draw_state();
         }
-        d3d_device_->SetRenderState(D3DRS_ALPHABLENDENABLE, old_alpha);
-        d3d_device_->SetRenderState(D3DRS_SRCBLEND, old_src);
-        d3d_device_->SetRenderState(D3DRS_DESTBLEND, old_dest);
-        d3d_device_->SetRenderState(D3DRS_ZENABLE, old_z);
-        d3d_device_->SetRenderState(D3DRS_LIGHTING, old_lighting);
-        d3d_device_->SetRenderState(D3DRS_CULLMODE, old_cull);
-        d3d_device_->SetVertexShader(old_shader);
     }
 
     void initialize_paths_from_module() {
@@ -2217,6 +2503,7 @@ private:
         CreateDirectoryA(settings_root, nullptr);
         std::snprintf(log_path_, sizeof(log_path_), "%s\\settings\\TargetLines\\native.log", module_path);
         std::snprintf(state_path_, sizeof(state_path_), "%s\\settings\\TargetLines\\lines.json", module_path);
+        std::snprintf(benchmark_path_, sizeof(benchmark_path_), "%s\\settings\\TargetLines\\benchmark.json", module_path);
     }
 
     void append_log(const char* message) {
@@ -2243,6 +2530,9 @@ private:
     }
 
     int count_lines() {
+        if (benchmark_enabled_) {
+            ++benchmark_current_state_reads_;
+        }
         FILE* file = std::fopen(state_path_, "rb");
         if (!file) {
             return -static_cast<int>(errno);
@@ -2271,9 +2561,26 @@ private:
     }
     char state_path_[1024] {};
     char log_path_[1024] {};
+    char benchmark_path_[1024] {};
     unsigned long postrender_calls_ = 0;
     int last_line_count_ = 0;
     IDirect3DDevice8* d3d_device_ = nullptr;
+    D3DMATRIX cached_view_ {};
+    D3DMATRIX cached_projection_ {};
+    bool projection_matrices_valid_ = false;
+    DWORD saved_shader_ = 0;
+    DWORD saved_alpha_ = 0;
+    DWORD saved_src_ = 0;
+    DWORD saved_dest_ = 0;
+    DWORD saved_z_ = 0;
+    DWORD saved_lighting_ = 0;
+    DWORD saved_cull_ = 0;
+    IDirect3DBaseTexture8* saved_texture_ = nullptr;
+    bool draw_state_active_ = false;
+    static constexpr int max_line_batch_vertices_ = 1400;
+    DrawVertex line_batch_vertices_[max_line_batch_vertices_] {};
+    int line_batch_vertex_count_ = 0;
+    bool line_batch_active_ = false;
     bool overlay_enabled_ = true;
     bool debug_bar_enabled_ = false;
     bool matrix_probe_pending_ = false;
@@ -2284,9 +2591,30 @@ private:
     float width_scale_ = 1.0f;
     float glow_scale_ = 1.0f;
     int dynamic_bone_ = 21;
+    static constexpr int benchmark_max_samples_ = 1024;
+    LARGE_INTEGER performance_frequency_ {};
+    LONGLONG previous_postrender_counter_ = 0;
+    bool benchmark_enabled_ = false;
+    bool benchmark_skip_next_sample_ = false;
+    int benchmark_line_count_ = 0;
+    int benchmark_sample_count_ = 0;
+    DWORD benchmark_last_report_ms_ = 0;
+    float benchmark_frame_samples_[benchmark_max_samples_] {};
+    float benchmark_overlay_samples_[benchmark_max_samples_] {};
+    unsigned long long benchmark_projection_total_ = 0;
+    unsigned long long benchmark_draw_call_total_ = 0;
+    unsigned long long benchmark_state_read_total_ = 0;
+    unsigned int benchmark_current_projections_ = 0;
+    unsigned int benchmark_current_draw_calls_ = 0;
+    unsigned int benchmark_current_state_reads_ = 0;
+    LineState cached_lines_[128] {};
+    int cached_line_count_ = 0;
+    unsigned long long cached_state_write_time_ = 0;
+    unsigned long long cached_state_file_size_ = 0;
+    bool state_cache_valid_ = false;
     bool boneprobe_requested_ = false;
     DWORD last_boneprobe_ms_ = 0;
-    static constexpr int max_active_lines_ = 64;
+    static constexpr int max_active_lines_ = 128;
     ActiveLine active_lines_[max_active_lines_] {};
     int active_line_count_ = 0;
 };
