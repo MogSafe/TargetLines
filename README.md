@@ -170,14 +170,14 @@ The settings panel includes:
 > - `Enemy Lines` _// enemy-origin action lines_
 > - `Other Party Lines` _// lines unrelated to your party_
 > - `Abilities/Spells` _// spells, weapon skills, abilities, and TP moves_
-> - `AoE Fan Lines` _// extra target lines for area actions_
+> - `AoE Style` _// original fan-out lines, Ring 1 comet markers, Ring 2 contracting markers, or off_
 > - `Color Blind Mode` _// alternate color palette_
 > - `Line Width` _// line thickness preset_
 > - `Player Opacity` _// opacity for player-origin lines_
 > - `Ally Opacity` _// opacity for party, trust, and pet lines_
 > - `Enemy Opacity` _// opacity for enemy-origin lines_
 > - `Line Duration` _// how long action lines remain visible_
-> - `AoE Fan Opacity` _// opacity for area-action fan-out lines_
+> - `AoE Opacity` _// opacity for the selected area-action indicator style_
 > - `Regular Attacks` _// first hit, delayed repeats, or off_
 
 `Enable Lines` is the master display toggle. The individual line toggles keep
@@ -200,7 +200,8 @@ additional commands, including debug commands.
 //tl enemylines [on|off]        Toggle enemy-origin lines.
 //tl otherpartylines [on|off]   Toggle lines unrelated to your party/trusts/pets.
 //tl speciallines [on|off]      Toggle abilities/spells/weapon skills/TP moves.
-//tl fanlines [on|off]          Toggle AoE fan-out lines.
+//tl fanlines [on|off]          Compatibility toggle for AoE indicators (enables Fan from Off).
+//tl aoemode off|fan|ring1|ring2 Select the AoE indicator presentation.
 //tl colorblind [on|off]        Toggle color blind mode.
 //tl regular first|repeat|off   Configure regular attack lines.
 //tl playeropacity +|-          Adjust player line opacity.

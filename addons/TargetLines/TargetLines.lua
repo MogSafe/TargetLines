@@ -5,6 +5,7 @@ _addon.commands = {'targetlines', 'tl'}
 
 config = require('config')
 texts = require('texts')
+local resources = require('resources')
 require('logger')
 
 local defaults = {}
@@ -21,7 +22,7 @@ defaults.enemy_opacity_scale = 0.70
 defaults.fade_scale = 1.0
 defaults.width_scale = 1.0
 defaults.glow_scale = 1.0
-defaults.fan_opacity_scale = 0.55
+defaults.aoe_opacity_scale = 0.55
 defaults.action_debug = false
 defaults.source_height_scale = 1.0
 defaults.target_height_scale = 1.0
@@ -34,6 +35,8 @@ defaults.show_party_lines = true
 defaults.show_enemy_lines = true
 defaults.show_pet_lines = true
 defaults.show_fan_lines = true
+defaults.aoe_mode = 'fan'
+defaults.ring_indicator_style = 'comet'
 defaults.show_special_lines = true
 defaults.show_other_party_lines = false
 defaults.color_blind_mode = false
@@ -66,6 +69,22 @@ if settings.regular_attack_mode ~= 'first' and settings.regular_attack_mode ~= '
     settings.regular_attack_mode = settings.regular_attack_once == false and 'repeat' or defaults.regular_attack_mode
 end
 settings.benchmark_lines = nil
+if settings.aoe_mode == 'ring' then
+    settings.aoe_mode = settings.ring_indicator_style == 'contracting_ring' and 'ring2' or 'ring1'
+elseif settings.aoe_mode ~= 'off' and settings.aoe_mode ~= 'fan'
+    and settings.aoe_mode ~= 'ring1' and settings.aoe_mode ~= 'ring2' then
+    settings.aoe_mode = defaults.aoe_mode
+end
+-- Migrate the former AoE enable toggle into the unified mode.
+if settings.show_fan_lines == false then
+    settings.aoe_mode = 'off'
+end
+settings.show_fan_lines = nil
+settings.ring_indicator_style = nil
+if settings.aoe_opacity_scale == nil then
+    settings.aoe_opacity_scale = tonumber(settings.fan_opacity_scale) or defaults.aoe_opacity_scale
+end
+settings.fan_opacity_scale = nil
 for _, opacity_key in ipairs({'player_opacity_scale', 'ally_opacity_scale', 'enemy_opacity_scale'}) do
     local saved_opacity = tonumber(settings[opacity_key])
     if saved_opacity == 1.0 then
@@ -104,11 +123,13 @@ local last_boneprobe_active = false
 local last_lines = {}
 local last_nearby = {}
 local recent_lines = {}
+local recent_rings = {}
 local seen_pairs = {}
 local seen_special_pairs = {}
 local recent_spell_starts = {}
 local recent_spell_events = {}
 local recent_ability_starts = {}
+local recent_action_casts = {}
 local probe_lines = {}
 local line_sequence = 0
 local update_config_box
@@ -187,14 +208,22 @@ local preset_rows = {
         {'Normal', 1.00},
         {'Long', 1.25},
     },
-    fan_opacity_scale = {
-        {'Low', 0.35},
-        {'Normal', 0.55},
-        {'High', 0.75},
+    aoe_opacity_scale = {
+        {'Very Low', 0.25},
+        {'Low', 0.55},
+        {'Normal', 0.70},
+        {'High', 1.00},
+        {'Very High', 1.25},
     },
     regular_attack_mode = {
         {'First Only', 'first'},
         {'Repeat After Delay', 'repeat'},
+        {'Off', 'off'},
+    },
+    aoe_mode = {
+        {'Fan', 'fan'},
+        {'Ring 1', 'ring1'},
+        {'Ring 2', 'ring2'},
         {'Off', 'off'},
     },
 }
@@ -207,7 +236,7 @@ local config_rows = {
     {type = 'toggle', name = 'show_enemy_lines', label = 'Enemy Lines'},
     {type = 'toggle', name = 'show_other_party_lines', label = 'Other Party Lines'},
     {type = 'toggle', name = 'show_special_lines', label = 'Abilities/Spells'},
-    {type = 'toggle', name = 'show_fan_lines', label = 'AoE Fan Lines'},
+    {type = 'choice', name = 'aoe_mode', label = 'AoE Style'},
     {type = 'toggle', name = 'color_blind_mode', label = 'Color Blind Mode'},
     {type = 'choice', name = 'width_scale', label = 'Line Width'},
     {type = 'choice', name = 'player_opacity_scale', label = 'Player Opacity'},
@@ -216,7 +245,7 @@ local config_rows = {
     -- Omitted from the UI for now because the effect is too subtle to justify the extra setting.
     -- {type = 'choice', name = 'glow_scale', label = 'Line Glow'},
     {type = 'choice', name = 'fade_scale', label = 'Line Duration'},
-    {type = 'choice', name = 'fan_opacity_scale', label = 'AoE Fan Opacity'},
+    {type = 'choice', name = 'aoe_opacity_scale', label = 'AoE Opacity'},
     {type = 'choice', name = 'regular_attack_mode', label = 'Regular Attacks'},
 }
 
@@ -240,6 +269,24 @@ local function regular_mode()
     end
 
     return settings.regular_attack_once == false and 'repeat' or 'first'
+end
+
+local function aoe_indicator_mode()
+    local mode = tostring(settings.aoe_mode or ''):lower()
+    if mode == 'off' or mode == 'fan' or mode == 'ring1' or mode == 'ring2' then
+        return mode
+    end
+
+    return defaults.aoe_mode
+end
+
+local function ring_indicator_style_id()
+    return aoe_indicator_mode() == 'ring2' and 10 or 1
+end
+
+local function ring_indicator_enabled(mode)
+    mode = mode or aoe_indicator_mode()
+    return mode == 'ring1' or mode == 'ring2'
 end
 
 local function slider_bar(name)
@@ -322,8 +369,8 @@ local function setting_detail(name)
         return ('%d%%'):format(math.floor(alpha * 100 + 0.5))
     elseif name == 'fade_scale' then
         return ('%.2fs'):format(defaults.action_timeout * slider_scale('fade_scale'))
-    elseif name == 'fan_opacity_scale' then
-        return ('%d%%'):format(math.floor((tonumber(settings.fan_opacity_scale) or defaults.fan_opacity_scale) * 100 + 0.5))
+    elseif name == 'aoe_opacity_scale' then
+        return ('%d%%'):format(math.floor((tonumber(settings.aoe_opacity_scale) or defaults.aoe_opacity_scale) * 100 + 0.5))
     elseif name == 'regular_attack_mode' and regular_mode() == 'repeat' then
         return ('%.1fs'):format(tonumber(settings.pair_cooldown) or defaults.pair_cooldown)
     end
@@ -363,6 +410,23 @@ local function centered_text(text, width)
     return string.rep(' ', left) .. text .. string.rep(' ', right)
 end
 
+local function clear_recent_aoe_visuals()
+    recent_rings = {}
+    for key, line in pairs(recent_lines) do
+        if tostring(line.kind or ''):find('_fan', 1, true) then
+            recent_lines[key] = nil
+        end
+    end
+end
+
+local function set_aoe_indicator_mode(mode)
+    settings.aoe_mode = mode
+    clear_recent_aoe_visuals()
+    config.save(settings)
+    last_signature = ''
+    update_config_box()
+end
+
 local function set_preset(name, direction)
     local presets = preset_rows[name]
     if not presets then
@@ -375,6 +439,8 @@ local function set_preset(name, direction)
     if name == 'regular_attack_mode' then
         settings.regular_attack_once = settings.regular_attack_mode ~= 'repeat'
         seen_pairs = {}
+    elseif name == 'aoe_mode' then
+        clear_recent_aoe_visuals()
     end
 
     config.save(settings)
@@ -523,6 +589,23 @@ local special_action_categories = {
     [14] = true,
     [15] = true,
 }
+
+-- Use resolved action packets for AoE detection. Begin packets generally only
+-- contain the initially selected target, while the resolved packet contains
+-- every target actually affected by the action.
+local aoe_action_categories = {
+    [3] = true,  -- weapon skill finish
+    [4] = true,  -- spell/magic finish
+    [6] = true,  -- job ability
+    [11] = true, -- monster TP move / special action
+    [13] = true, -- pet/avatar ability
+    [14] = true, -- job ability variant
+    [15] = true, -- job ability variant
+}
+
+local function is_aoe_action(category, target_count)
+    return (tonumber(target_count) or 0) > 1 and aoe_action_categories[category] or false
+end
 
 local default_colors = {
     player = 0xF040F0FF,
@@ -937,8 +1020,8 @@ local function party_entity(mob, party)
 end
 
 local function line_allowed(source, target, party, special, fan)
-    if fan and settings.show_fan_lines == false then
-        return false, 'fan_lines_disabled'
+    if fan and aoe_indicator_mode() == 'off' then
+        return false, 'aoe_indicators_disabled'
     end
 
     if special and settings.show_special_lines == false then
@@ -986,11 +1069,103 @@ end
 
 local function action_spell_id(category, packet, action_target)
     local first_action = action_target and action_target.actions and action_target.actions[1] or nil
-    if category == 8 then
+    if category == 7 or category == 8 then
         return tonumber(first_action and (first_action.param or first_action.Param)) or tonumber(packet and (packet.param or packet.Param or packet['Param'])) or 0
     end
 
     return tonumber(packet and (packet.param or packet.Param or packet['Param'])) or tonumber(first_action and (first_action.param or first_action.Param)) or 0
+end
+
+local caster_centered_elemental_ra = {
+    Stone = true,
+    Water = true,
+    Aero = true,
+    Fire = true,
+    Blizz = true,
+    Thunder = true,
+}
+
+local aoe_center_overrides = {
+    spell = {},
+    weapon_skill = {},
+    job_ability = {},
+    monster_ability = {},
+    pet_ability = {},
+}
+
+local function cast_family(category)
+    if category == 4 or category == 8 then
+        return 'spell'
+    elseif category == 3 or category == 7 or category == 11 then
+        return 'ability'
+    end
+
+    return nil
+end
+
+local function cast_key(family, source, action_id)
+    return tostring(family or 'action') .. ':' .. tostring(source and source.id or 0) .. ':' .. tostring(action_id or 0)
+end
+
+local function packet_primary_target(packet)
+    local entry = packet and packet.targets and packet.targets[1] or nil
+    if not entry then
+        return nil
+    end
+
+    local target = mob_by_id_or_index(entry.id, entry.index)
+    return target and enrich_from_party(target) or nil
+end
+
+local function refresh_cast_target(target)
+    if not target then
+        return nil
+    end
+
+    local live = mob_by_id_or_index(target.id, target.index)
+    return enrich_from_party(live or target)
+end
+
+local function is_caster_centered_spell(spell)
+    local name = tostring(spell and spell.en or '')
+    if name:match('^Protectra') or name:match('^Shellra') or name:match('^Bar.+ra$')
+        or name:match('^Indi%-') or name:match('^Boost%-') or name:match('^Gain%-') then
+        return true
+    end
+
+    local elemental_family = name:match('^(Stone)ra') or name:match('^(Water)ra') or name:match('^(Aero)ra')
+        or name:match('^(Fire)ra') or name:match('^(Blizz)ra') or name:match('^(Thunder)ra')
+    return caster_centered_elemental_ra[elemental_family] == true
+end
+
+local function aoe_center_mode(category, action_id, source, primary)
+    if not primary or (source.id and primary.id and source.id == primary.id) then
+        return 'source'
+    end
+
+    if category == 4 then
+        local override = aoe_center_overrides.spell[action_id]
+        if override then
+            return override
+        end
+        return is_caster_centered_spell(resources.spells[action_id]) and 'source' or 'target'
+    elseif category == 3 then
+        return aoe_center_overrides.weapon_skill[action_id] or 'target'
+    elseif category == 6 then
+        return aoe_center_overrides.job_ability[action_id] or 'source'
+    elseif category == 11 then
+        return aoe_center_overrides.monster_ability[action_id] or 'source'
+    elseif category == 13 or category == 14 or category == 15 then
+        return aoe_center_overrides.pet_ability[action_id] or 'source'
+    end
+
+    return 'source'
+end
+
+local function remove_provisional_cast_line(cast)
+    if cast and cast.line_key then
+        recent_lines[cast.line_key] = nil
+    end
 end
 
 local function add_recent_line(source, target, kind, color, timeout, options)
@@ -1001,7 +1176,7 @@ local function add_recent_line(source, target, kind, color, timeout, options)
     options = options or {}
     local pair_key = tostring(source.id) .. '>' .. tostring(target.id)
     local now = os.clock()
-    if options.always_draw and options.special_cooldown then
+    if options.always_draw and options.special_cooldown and not options.ignore_special_cooldown then
         local cooldown = tonumber(settings.special_cooldown) or defaults.special_cooldown
         if cooldown > 0 and seen_special_pairs[pair_key] and now - seen_special_pairs[pair_key] < cooldown then
             return false, 'special_cooldown'
@@ -1039,10 +1214,46 @@ local function add_recent_line(source, target, kind, color, timeout, options)
         target = target,
         kind = kind or 'player',
         color = color or 0xEFFFFFFF,
+        action_id = tonumber(options.action_id) or 0,
         created = now,
         timeout = timeout or effective_timeout(),
     }
     probe_lines = {recent_lines[key]}
+    last_signature = ''
+    return true, key
+end
+
+local function add_recent_ring(center, targets, kind, color, timeout)
+    if not is_visible_entity(center) or not targets or #targets < 1 then
+        return false, 'invalid_ring'
+    end
+
+    local radius = 0
+    for _, target in ipairs(targets) do
+        if is_visible_entity(target) then
+            local dx = (tonumber(target.x) or 0) - (tonumber(center.x) or 0)
+            local dy = (tonumber(target.y) or 0) - (tonumber(center.y) or 0)
+            radius = math.max(radius, math.sqrt(dx * dx + dy * dy))
+        end
+    end
+
+    if radius <= 0.1 then
+        return false, 'ring_too_small'
+    end
+
+    line_sequence = line_sequence + 1
+    local key = tostring(center.id or 0) .. '#ring#' .. tostring(line_sequence)
+    recent_rings[key] = {
+        uid = line_sequence,
+        center = center,
+        targets = targets,
+        radius = radius,
+        kind = kind or 'aoe_ring',
+        color = color or 0xEFFFFFFF,
+        indicator_style = ring_indicator_style_id(),
+        created = os.clock(),
+        timeout = timeout or effective_timeout(),
+    }
     last_signature = ''
     return true, key
 end
@@ -1092,6 +1303,49 @@ local function handle_action_packet(packet)
     local special = special_action_categories[category] or false
     local target_count = packet.targets and #packet.targets or 0
     local now = os.clock()
+    local first_action_target = packet.targets and packet.targets[1] or nil
+    local action_id = action_spell_id(category, packet, first_action_target)
+    local family = cast_family(category)
+    local primary_target = packet_primary_target(packet)
+    local active_cast = nil
+    local active_cast_key = nil
+    if (category == 7 or category == 8) and family then
+        active_cast_key = cast_key(family, source, action_id)
+        active_cast = {
+            created = now,
+            target = primary_target,
+            line_key = nil,
+        }
+        recent_action_casts[active_cast_key] = active_cast
+    elseif (category == 3 or category == 4 or category == 11) and family then
+        active_cast_key = cast_key(family, source, action_id)
+        active_cast = recent_action_casts[active_cast_key]
+        if active_cast and now - (active_cast.created or now) <= duplicate_finish_window then
+            primary_target = refresh_cast_target(active_cast.target) or primary_target
+        else
+            active_cast = nil
+        end
+    end
+
+    local resolved_aoe = is_aoe_action(category, target_count)
+    if resolved_aoe then
+        -- The resolved packet is authoritative. Replace the provisional start
+        -- line so fast casts cannot leave an overlapping primary-target line.
+        remove_provisional_cast_line(active_cast)
+    end
+
+    local ring_targets = {}
+    local ring_kind = nil
+    local ring_color = nil
+    local ring_center = source
+    local center_mode = 'source'
+    if resolved_aoe then
+        center_mode = aoe_center_mode(category, action_id, source, primary_target)
+        if center_mode == 'target' and primary_target then
+            ring_center = primary_target
+        end
+    end
+    local indicator_mode = aoe_indicator_mode()
     for _, action_target in ipairs(packet.targets or {}) do
         local target = mob_by_id_or_index(action_target.id, action_target.index)
         if target then
@@ -1101,20 +1355,22 @@ local function handle_action_packet(packet)
             if category == 4 or category == 8 then
                 spell_key = pair_key .. ':' .. tostring(action_spell_id(category, packet, action_target))
             end
-            if spell_key and recent_spell_events[spell_key] and now - recent_spell_events[spell_key] <= duplicate_finish_window then
-                -- Categories 4 and 8 can arrive in either order for spells; keep only newly affected AoE targets.
+            if not resolved_aoe and spell_key and recent_spell_events[spell_key]
+                and now - recent_spell_events[spell_key] <= duplicate_finish_window then
+                -- Single-target start/finish packets retain the existing duplicate suppression.
                 action_debug_log('skip', packet, source, target, action_target, 'repeat_spell_target')
                 target = nil
-            elseif (category == 3 or category == 11) and recent_ability_starts[pair_key] and now - recent_ability_starts[pair_key] <= duplicate_finish_window then
-                -- Category 3/11 can repeat the TP/ability ready target on resolve; keep only newly affected AoE targets.
+            elseif not resolved_aoe and (category == 3 or category == 11) and recent_ability_starts[pair_key]
+                and now - recent_ability_starts[pair_key] <= duplicate_finish_window then
+                -- Single-target ability resolutions likewise retain duplicate suppression.
                 action_debug_log('skip', packet, source, target, action_target, 'repeat_ability_target')
                 target = nil
             end
         end
 
         if target then
-            local fan = target_count > 1 and (category == 8 or category == 11)
-            local allowed, allow_reason = line_allowed(source, target, party, special, fan)
+            local aoe = is_aoe_action(category, target_count)
+            local allowed, allow_reason = line_allowed(source, target, party, special, aoe)
             if not allowed then
                 if special or settings.action_debug then
                     action_debug_log('skip', packet, source, target, action_target, allow_reason)
@@ -1125,17 +1381,33 @@ local function handle_action_packet(packet)
 
         if target then
             local kind, color = classify_line(source, target, party)
-            local fan = target_count > 1 and (category == 8 or category == 11)
+            local fan = is_aoe_action(category, target_count)
             color = scale_color_alpha(color, role_opacity_scale(line_source_role(source, party)))
             if special then
                 kind = kind .. '_special'
             end
             if fan then
                 kind = kind .. '_fan'
-                color = scale_color_alpha(color, tonumber(settings.fan_opacity_scale) or defaults.fan_opacity_scale)
+                color = scale_color_alpha(color, tonumber(settings.aoe_opacity_scale) or defaults.aoe_opacity_scale)
+                if ring_indicator_enabled(indicator_mode) then
+                    ring_targets[#ring_targets + 1] = target
+                    ring_kind = ring_kind or (kind .. '_ring')
+                    ring_color = ring_color or color
+                end
             end
 
-            local drawn, reason = add_recent_line(source, target, kind, color, effective_timeout(), {always_draw = special, special_cooldown = special})
+            local drawn, reason = true, 'ring_mode'
+            if not fan or indicator_mode == 'fan' then
+                drawn, reason = add_recent_line(source, target, kind, color, effective_timeout(), {
+                    always_draw = special,
+                    special_cooldown = special,
+                    ignore_special_cooldown = resolved_aoe,
+                    action_id = action_id,
+                })
+            end
+            if active_cast and (category == 7 or category == 8) and drawn and reason then
+                active_cast.line_key = reason
+            end
             if special or settings.action_debug then
                 action_debug_log(drawn and 'draw' or 'skip', packet, source, target, action_target, reason or kind)
             end
@@ -1148,6 +1420,19 @@ local function handle_action_packet(packet)
                 recent_ability_starts[tostring(source.id) .. '>' .. tostring(target.id)] = now
             end
         end
+    end
+
+    if ring_indicator_enabled(indicator_mode) and #ring_targets > 0 then
+        add_recent_ring(ring_center, ring_targets, ring_kind, ring_color, effective_timeout())
+        if settings.action_debug then
+            append_runtime_log(('aoe_center cat=%s action=%s mode=%s source=%s center=%s targets=%s')
+                :format(tostring(category), tostring(action_id), center_mode, tostring(source.name),
+                    tostring(ring_center.name), tostring(#ring_targets)))
+        end
+    end
+
+    if active_cast_key and (category == 3 or category == 4 or category == 11) then
+        recent_action_casts[active_cast_key] = nil
     end
 end
 
@@ -1366,6 +1651,7 @@ end
 
 local function collect_lines()
     local lines = {}
+    local rings = {}
     local now = os.clock()
     local party = party_ids()
     local next_expiration = 0
@@ -1378,6 +1664,22 @@ local function collect_lines()
         else
             lines[#lines + 1] = line
             local expires_at = (line.created or now) + timeout
+            if next_expiration == 0 or expires_at < next_expiration then
+                next_expiration = expires_at
+            end
+        end
+    end
+
+    for key, ring in pairs(recent_rings) do
+        local age = now - (ring.created or now)
+        local timeout = tonumber(ring.timeout) or defaults.action_timeout
+        -- Keep the ring payload available long enough for the expanding wave to
+        -- reach distant targets and for their one-second halo fade to complete.
+        if age > timeout + 1.0 then
+            recent_rings[key] = nil
+        else
+            rings[#rings + 1] = ring
+            local expires_at = (ring.created or now) + timeout + 1.0
             if next_expiration == 0 or expires_at < next_expiration then
                 next_expiration = expires_at
             end
@@ -1434,11 +1736,21 @@ local function collect_lines()
         end
     end
 
+    for key, cast in pairs(recent_action_casts) do
+        if now - (cast.created or now) > duplicate_finish_window then
+            recent_action_casts[key] = nil
+        end
+    end
+
     table.sort(lines, function(left, right)
         return (left.created or 0) > (right.created or 0)
     end)
 
-    return lines, nearby, next_expiration
+    table.sort(rings, function(left, right)
+        return (left.created or 0) > (right.created or 0)
+    end)
+
+    return lines, nearby, rings, next_expiration
 end
 
 local function point_json(mob)
@@ -1485,7 +1797,8 @@ update_config_box = function()
     config_box:show()
 end
 
-local function encode_state(lines)
+local function encode_state(lines, rings)
+    rings = rings or {}
     local info = windower.ffxi.get_info() or {}
     local parts = {
         ('"zone":%u'):format(tonumber(info.zone) or 0),
@@ -1520,6 +1833,27 @@ local function encode_state(lines)
     end
 
     parts[#parts + 1] = ']'
+    parts[#parts + 1] = ',"rings":['
+    for index, ring in ipairs(rings) do
+        if index > 1 then
+            parts[#parts + 1] = ','
+        end
+
+        local color = tonumber(ring.color) or 0xEFFFFFFF
+        local timeout = tonumber(ring.timeout) or effective_timeout()
+        parts[#parts + 1] = ('{"uid":%u,"center":%s,"radius":%.4f,"kind":%s,"color":%u,"timeout":%.3f,"indicator_style":%u,"targets":[')
+            :format(tonumber(ring.uid) or 0, point_json(ring.center), tonumber(ring.radius) or 0,
+                json_string(ring.kind), color, timeout, tonumber(ring.indicator_style) or ring_indicator_style_id())
+        for target_index, target in ipairs(ring.targets or {}) do
+            if target_index > 1 then
+                parts[#parts + 1] = ','
+            end
+            parts[#parts + 1] = point_json(target)
+        end
+        parts[#parts + 1] = ']}'
+    end
+
+    parts[#parts + 1] = ']'
     parts[#parts + 1] = ',"probe_lines":['
     for index, line in ipairs(probe_lines) do
         if index > 1 then
@@ -1537,8 +1871,8 @@ local function encode_state(lines)
     return '{' .. table.concat(parts) .. '\n'
 end
 
-local function write_state(lines)
-    local state = encode_state(lines)
+local function write_state(lines, rings)
+    local state = encode_state(lines, rings)
     if state == last_signature then
         return
     end
@@ -1603,12 +1937,12 @@ windower.register_event('prerender', function()
     local rebuild_state = state_invalidated or expiration_due or maintenance_due or settings.claim_fallback == true
 
     if rebuild_state then
-        local lines, nearby, expiration = collect_lines()
+        local lines, nearby, rings, expiration = collect_lines()
         last_state_maintenance = now
         next_line_expiration = expiration
         last_nearby = nearby
         last_lines = lines
-        write_state(lines)
+        write_state(lines, rings)
     end
 
     last_boneprobe_active = boneprobe_active
@@ -1685,7 +2019,28 @@ windower.register_event('addon command', function(command, ...)
     elseif command == 'speciallines' or command == 'specials' then
         log('TargetLines special action lines ' .. (set_boolean_from_arg('show_special_lines', args[1]) and 'enabled.' or 'disabled.'))
     elseif command == 'fanlines' or command == 'fan' or command == 'aoe' then
-        log('TargetLines AoE fan lines ' .. (set_boolean_from_arg('show_fan_lines', args[1]) and 'enabled.' or 'disabled.'))
+        local value = args[1] and args[1]:lower() or nil
+        local mode = aoe_indicator_mode()
+        if value == 'on' or value == '1' or value == 'true' or value == 'yes' then
+            mode = mode == 'off' and 'fan' or mode
+        elseif value == 'off' or value == '0' or value == 'false' or value == 'no' then
+            mode = 'off'
+        else
+            mode = mode == 'off' and 'fan' or 'off'
+        end
+        set_aoe_indicator_mode(mode)
+        log('TargetLines AoE indicators set to ' .. mode .. '.')
+    elseif command == 'aoemode' or command == 'aoeindicator' then
+        local mode = args[1] and args[1]:lower() or nil
+        if mode == 'ring' then
+            mode = 'ring1'
+        end
+        if mode ~= 'off' and mode ~= 'fan' and mode ~= 'ring1' and mode ~= 'ring2' then
+            warning('Usage: //tl aoemode off|fan|ring1|ring2')
+            return
+        end
+        set_aoe_indicator_mode(mode)
+        log('TargetLines AoE indicators set to ' .. mode .. '.')
     elseif command == 'colorblind' or command == 'colourblind' or command == 'cbmode' then
         log('TargetLines color blind mode ' .. (set_boolean_from_arg('color_blind_mode', args[1]) and 'enabled.' or 'disabled.'))
     elseif command == 'playeropacity' or command == 'popacity' then
@@ -1748,25 +2103,25 @@ windower.register_event('addon command', function(command, ...)
             return
         end
         log(('TargetLines glow scale set to %d%%.'):format(math.floor(slider_scale('glow_scale') * 100 + 0.5)))
-    elseif command == 'fanopacity' or command == 'fanopacityscale' then
+    elseif command == 'aoeopacity' or command == 'aoeopacityscale' or command == 'fanopacity' or command == 'fanopacityscale' then
         local value = args[1] and args[1]:lower() or nil
-        local current = tonumber(settings.fan_opacity_scale) or defaults.fan_opacity_scale
+        local current = tonumber(settings.aoe_opacity_scale) or defaults.aoe_opacity_scale
         if value == '+' then
-            settings.fan_opacity_scale = clamp(current + 0.01, 0.1, 1.0)
+            settings.aoe_opacity_scale = clamp(current + 0.01, 0.1, 1.25)
         elseif value == '-' then
-            settings.fan_opacity_scale = clamp(current - 0.01, 0.1, 1.0)
+            settings.aoe_opacity_scale = clamp(current - 0.01, 0.1, 1.25)
         else
             local opacity = tonumber(args[1])
-            if not (opacity and opacity >= 0.1 and opacity <= 1) then
-                warning('Usage: //tl fanopacity <0.1-1>|+|-')
+            if not (opacity and opacity >= 0.1 and opacity <= 1.25) then
+                warning('Usage: //tl aoeopacity <0.1-1.25>|+|-')
                 return
             end
-            settings.fan_opacity_scale = opacity
+            settings.aoe_opacity_scale = opacity
         end
         config.save(settings)
         last_signature = ''
         update_config_box()
-        log(('TargetLines AoE fan opacity set to %d%%.'):format(math.floor(settings.fan_opacity_scale * 100 + 0.5)))
+        log(('TargetLines AoE opacity set to %d%%.'):format(math.floor(settings.aoe_opacity_scale * 100 + 0.5)))
     elseif command == 'sourceheight' or command == 'sourceht' then
         local value = args[1] and args[1]:lower() or nil
         if value == '+' then
@@ -1899,14 +2254,16 @@ windower.register_event('addon command', function(command, ...)
             tonumber(settings.auto_inspect_interval) or defaults.auto_inspect_interval))
     elseif command == 'clear' then
         recent_lines = {}
+        recent_rings = {}
         seen_pairs = {}
         seen_special_pairs = {}
         recent_spell_starts = {}
         recent_spell_events = {}
         recent_ability_starts = {}
+        recent_action_casts = {}
         probe_lines = {}
         last_signature = ''
-        write_state({})
+        write_state({}, {})
         log('TargetLines lines cleared.')
     elseif command == 'boneprobe' or command == 'anchorprobe' then
         local lines = (#last_lines > 0) and last_lines or probe_lines
@@ -1921,17 +2278,17 @@ windower.register_event('addon command', function(command, ...)
         append_runtime_log('boneprobe flag written for latest line')
         log('TargetLines bone probe requested for latest line.')
     elseif command == 'status' then
-        log(('enabled=%s debug=%s action_debug=%s player=%s party=%s pet=%s enemy=%s other_party=%s special=%s fan=%s color_blind=%s range=%s global_opacity=%s player_opacity=%s ally_opacity=%s enemy_opacity=%s fan_opacity=%s fade=%s width=%s glow=%s source_height=%s target_height=%s interval=%s regular=%s repeat_delay=%s special_cooldown=%s claim=%s auto_inspect=%s auto_interval=%s state=%s lines=%s nearby=%s')
+        log(('enabled=%s debug=%s action_debug=%s player=%s party=%s pet=%s enemy=%s other_party=%s special=%s aoe_mode=%s color_blind=%s range=%s global_opacity=%s player_opacity=%s ally_opacity=%s enemy_opacity=%s aoe_opacity=%s fade=%s width=%s glow=%s source_height=%s target_height=%s interval=%s regular=%s repeat_delay=%s special_cooldown=%s claim=%s auto_inspect=%s auto_interval=%s state=%s lines=%s nearby=%s')
             :format(tostring(settings.enabled), tostring(settings.debug), tostring(settings.action_debug),
                 tostring(settings.show_player_lines ~= false), tostring(settings.show_party_lines ~= false),
                 tostring(settings.show_pet_lines ~= false), tostring(settings.show_enemy_lines ~= false),
                 tostring(settings.show_other_party_lines ~= false),
-                tostring(settings.show_special_lines ~= false), tostring(settings.show_fan_lines ~= false),
+                tostring(settings.show_special_lines ~= false), aoe_indicator_mode(),
                 tostring(settings.color_blind_mode == true),
                 tostring(settings.scan_range), tostring(defaults.opacity * slider_scale('opacity_scale')),
                 tostring(slider_scale('player_opacity_scale')), tostring(slider_scale('ally_opacity_scale')),
                 tostring(slider_scale('enemy_opacity_scale')),
-                tostring(tonumber(settings.fan_opacity_scale) or defaults.fan_opacity_scale),
+                tostring(tonumber(settings.aoe_opacity_scale) or defaults.aoe_opacity_scale),
                 tostring(effective_timeout()),
                 tostring(slider_scale('width_scale')), tostring(slider_scale('glow_scale')),
                 tostring(effective_source_height()), tostring(effective_target_height()),
@@ -1939,17 +2296,17 @@ windower.register_event('addon command', function(command, ...)
                 tostring(settings.pair_cooldown), tostring(settings.special_cooldown), tostring(settings.claim_fallback),
                 tostring(settings.auto_inspect == true), tostring(tonumber(settings.auto_inspect_interval) or defaults.auto_inspect_interval),
                 state_path, tostring(#last_lines), tostring(#last_nearby)))
-        append_runtime_log(('status enabled=%s debug=%s action_debug=%s player=%s party=%s pet=%s enemy=%s other_party=%s special=%s fan=%s color_blind=%s range=%s global_opacity=%s player_opacity=%s ally_opacity=%s enemy_opacity=%s fan_opacity=%s fade=%s width=%s glow=%s source_height=%s target_height=%s interval=%s regular=%s repeat_delay=%s special_cooldown=%s claim=%s auto_inspect=%s auto_interval=%s lines=%s nearby=%s')
+        append_runtime_log(('status enabled=%s debug=%s action_debug=%s player=%s party=%s pet=%s enemy=%s other_party=%s special=%s aoe_mode=%s color_blind=%s range=%s global_opacity=%s player_opacity=%s ally_opacity=%s enemy_opacity=%s aoe_opacity=%s fade=%s width=%s glow=%s source_height=%s target_height=%s interval=%s regular=%s repeat_delay=%s special_cooldown=%s claim=%s auto_inspect=%s auto_interval=%s lines=%s nearby=%s')
             :format(tostring(settings.enabled), tostring(settings.debug), tostring(settings.action_debug),
                 tostring(settings.show_player_lines ~= false), tostring(settings.show_party_lines ~= false),
                 tostring(settings.show_pet_lines ~= false), tostring(settings.show_enemy_lines ~= false),
                 tostring(settings.show_other_party_lines ~= false),
-                tostring(settings.show_special_lines ~= false), tostring(settings.show_fan_lines ~= false),
+                tostring(settings.show_special_lines ~= false), aoe_indicator_mode(),
                 tostring(settings.color_blind_mode == true),
                 tostring(settings.scan_range), tostring(defaults.opacity * slider_scale('opacity_scale')),
                 tostring(slider_scale('player_opacity_scale')), tostring(slider_scale('ally_opacity_scale')),
                 tostring(slider_scale('enemy_opacity_scale')),
-                tostring(tonumber(settings.fan_opacity_scale) or defaults.fan_opacity_scale),
+                tostring(tonumber(settings.aoe_opacity_scale) or defaults.aoe_opacity_scale),
                 tostring(effective_timeout()),
                 tostring(slider_scale('width_scale')), tostring(slider_scale('glow_scale')),
                 tostring(effective_source_height()), tostring(effective_target_height()),
@@ -1970,7 +2327,7 @@ windower.register_event('addon command', function(command, ...)
         append_runtime_log('native command forwarded via addon alias: ' .. native_command)
         log('TargetLines native command forwarded: ' .. native_command)
     else
-        log('Commands: //tl on | off | config | settings | playerlines [on|off] | partylines [on|off] | petlines [on|off] | enemylines [on|off] | otherpartylines [on|off] | speciallines [on|off] | fanlines [on|off] | colorblind [on|off] | regular first|repeat|off | playeropacity +/- | allyopacity +/- | enemyopacity +/- | opacity +/- | fade +/- | width +/- | glow +/- | fanopacity +/- | debug [on|off] | actiondebug [on|off] | sourceheight +/- | targetheight +/- | timeout <sec> | range <yalms> | interval <sec> | cooldown <sec> | specialcooldown <sec> | claim [on|off] | autoinspect [on|off] | autoinspect interval <sec> | boneprobe | luamobprobe | dynamicbone <auto|off|0-255> | clear | status | inspect')
+        log('Commands: //tl on | off | config | settings | playerlines [on|off] | partylines [on|off] | petlines [on|off] | enemylines [on|off] | otherpartylines [on|off] | speciallines [on|off] | fanlines [on|off] | aoemode off|fan|ring1|ring2 | aoeopacity <0.1-1.25>|+|- | colorblind [on|off] | regular first|repeat|off | playeropacity +/- | allyopacity +/- | enemyopacity +/- | opacity +/- | fade +/- | width +/- | glow +/- | debug [on|off] | actiondebug [on|off] | sourceheight +/- | targetheight +/- | timeout <sec> | range <yalms> | interval <sec> | cooldown <sec> | specialcooldown <sec> | claim [on|off] | autoinspect [on|off] | autoinspect interval <sec> | boneprobe | luamobprobe | dynamicbone <auto|off|0-255> | clear | status | inspect')
     end
 end)
 

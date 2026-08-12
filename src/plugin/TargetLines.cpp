@@ -804,6 +804,43 @@ private:
         DWORD color = 0xEFFFFFFF;
     };
 
+    struct RingTargetState {
+        DWORD id = 0;
+        DWORD index = 0;
+        float x = 0.0f;
+        float y = 0.0f;
+        float z = 0.0f;
+        float model_size = 0.0f;
+        float model_scale = 1.0f;
+        bool short_anchor = false;
+        bool floating_anchor = false;
+        bool is_npc = false;
+    };
+
+    static constexpr int max_ring_targets_per_ring_ = 32;
+    static constexpr int max_rings_per_state_ = 8;
+    static constexpr float ring_marker_duration_ = 1.00f;
+
+    struct RingState {
+        DWORD uid = 0;
+        DWORD center_id = 0;
+        DWORD center_index = 0;
+        float center_x = 0.0f;
+        float center_y = 0.0f;
+        float center_z = 0.0f;
+        float center_model_size = 0.0f;
+        float center_model_scale = 1.0f;
+        bool center_short_anchor = false;
+        bool center_floating_anchor = false;
+        bool center_is_npc = false;
+        float radius = 0.0f;
+        float timeout = 1.5f;
+        DWORD color = 0xEFFFFFFF;
+        int indicator_style = 1;
+        int target_count = 0;
+        RingTargetState targets[max_ring_targets_per_ring_] {};
+    };
+
     struct ActiveLine {
         unsigned long long key = 0;
         DWORD start_ms = 0;
@@ -823,14 +860,22 @@ private:
         float z = 0.0f;
     };
 
+    struct ActiveRing {
+        unsigned long long key = 0;
+        DWORD start_ms = 0;
+        DWORD last_seen_ms = 0;
+    };
+
     void draw_lines() {
-        LineState lines[128] {};
-        const int line_count = read_lines(lines, 128);
-        if (line_count <= 0) {
+        LineState lines[16] {};
+        RingState rings[8] {};
+        const int line_count = read_state(lines, 16, rings, 8);
+        const int ring_count = last_ring_count_;
+        if (line_count <= 0 && ring_count <= 0) {
             return;
         }
 
-        if (boneprobe_requested_) {
+        if (boneprobe_requested_ && line_count > 0) {
             boneprobe_requested_ = false;
             const DWORD now_ms = GetTickCount();
             if (now_ms - last_boneprobe_ms_ > 1000) {
@@ -855,8 +900,8 @@ private:
         anchor_cache_count_ = 0;
 
         const DWORD now_ms = GetTickCount();
-        bool spread_sources[128] {};
-        bool spread_targets[128] {};
+        bool spread_sources[16] {};
+        bool spread_targets[16] {};
         prepare_new_line_relationships(lines, line_count, spread_sources, spread_targets);
 
         if (!begin_draw_state()) {
@@ -864,6 +909,10 @@ private:
         }
 
         begin_line_batch();
+        for (int i = 0; i < ring_count; ++i) {
+            draw_aoe_ring(rings[i], viewport, mob_array, now_ms);
+        }
+
         for (int i = 0; i < line_count; ++i) {
             ActiveLine* active = nullptr;
             float progress = 1.0f;
@@ -883,6 +932,7 @@ private:
         end_line_batch();
         end_draw_state();
         prune_active_lines(now_ms);
+        prune_active_rings(now_ms);
     }
 
     bool prepare_animated_line(const LineState& line, DWORD now_ms, bool spread_source, bool spread_target, ActiveLine*& active, float& progress, float& arc_settle, float& settle, float& tail, DWORD& color) {
@@ -1107,6 +1157,269 @@ private:
         return (static_cast<unsigned long long>(uid) << 32) ^ (static_cast<unsigned long long>(source) << 16) ^ target;
     }
 
+    unsigned long long ring_key(const RingState& ring) const {
+        const DWORD center = ring.center_id ? ring.center_id : static_cast<DWORD>(std::fabs(ring.center_x * 100.0f) + std::fabs(ring.center_y * 100.0f));
+        const DWORD uid = ring.uid ? ring.uid : center;
+        return (static_cast<unsigned long long>(uid) << 32) ^ center;
+    }
+
+    void draw_aoe_ring(const RingState& ring, const D3DVIEWPORT8& viewport, std::uintptr_t mob_array, DWORD now_ms) {
+        if (ring.radius <= 0.1f) {
+            return;
+        }
+
+        const unsigned long long key = ring_key(ring);
+        ActiveRing* active = find_active_ring(key);
+        if (!active) {
+            active = allocate_active_ring(key, now_ms);
+        }
+
+        if (!active) {
+            return;
+        }
+
+        active->last_seen_ms = now_ms;
+        const float timeout = std::fmax(ring.timeout, 0.1f);
+        const float age = static_cast<float>(now_ms - active->start_ms) / 1000.0f;
+        const float pulse_duration = std::fmin(0.80f, timeout * 0.55f);
+        const float visual_lifetime = std::fmax(timeout, pulse_duration + ring_marker_duration_);
+        if (age > visual_lifetime) {
+            return;
+        }
+
+        const float fade_start = timeout * 0.55f;
+        float fade = 1.0f;
+        if (age > fade_start) {
+            fade = 1.0f - std::fmax(0.0f, std::fmin((age - fade_start) / std::fmax(timeout - fade_start, 0.1f), 1.0f));
+        }
+
+        const float pulse_t_raw = std::fmax(0.0f, std::fmin(age / std::fmax(pulse_duration, 0.05f), 1.0f));
+        const float inverse_t = 1.0f - pulse_t_raw;
+        const float pulse_t = 1.0f - std::pow(inverse_t, 1.5f);
+        constexpr float pulse_start_scale = 0.08f;
+        const float pulse_radius = ring.radius * (pulse_start_scale + (1.0f - pulse_start_scale) * pulse_t);
+        const float thickness = 10.5f * width_scale_;
+        const float haze_thickness = 16.5f * width_scale_ * (0.75f + glow_scale_ * 0.25f);
+        const float outer_attack_t = std::fmax(0.0f, std::fmin(age / 0.20f, 1.0f));
+        const float outer_attack = outer_attack_t * outer_attack_t * (3.0f - 2.0f * outer_attack_t);
+        const DWORD outer_color = scale_alpha(ring.color, 0.38f * outer_attack * fade * opacity_scale_);
+        const DWORD pulse_color = scale_alpha(ring.color, (0.82f - pulse_t * 0.18f) * fade * opacity_scale_);
+        const DWORD outer_haze_color = scale_alpha(saturate_color(ring.color), 0.16f * outer_attack * fade * opacity_scale_);
+        const DWORD pulse_haze_color = scale_alpha(saturate_color(ring.color), 0.24f * fade * opacity_scale_);
+
+        float center_x = ring.center_x;
+        float center_y = ring.center_y;
+        const float center_height = model_adjusted_height(source_height_offset_, ring.center_model_size,
+            ring.center_model_scale, ring.center_short_anchor, ring.center_floating_anchor, ring.center_is_npc);
+        float center_z = ring.center_z + center_height;
+        resolve_live_anchor_cached(mob_array, ring.center_is_npc, ring.center_index,
+            dynamic_bone_, center_height, center_x, center_y, center_z);
+
+        if (age <= timeout) {
+            draw_projected_ring(viewport, center_x, center_y, center_z, ring.radius, haze_thickness, outer_haze_color);
+            draw_projected_ring(viewport, center_x, center_y, center_z, ring.radius, thickness, outer_color);
+            draw_projected_ring(viewport, center_x, center_y, center_z, std::fmax(0.05f, pulse_radius), haze_thickness, pulse_haze_color);
+            draw_projected_ring(viewport, center_x, center_y, center_z, std::fmax(0.05f, pulse_radius), thickness, pulse_color);
+        }
+
+        for (int i = 0; i < ring.target_count; ++i) {
+            const RingTargetState& target = ring.targets[i];
+            const bool center_target_by_id = ring.center_id != 0 && target.id != 0
+                && ring.center_id == target.id;
+            const bool center_target_by_index = ring.center_index != 0 && target.index != 0
+                && ring.center_index == target.index && ring.center_is_npc == target.is_npc;
+            draw_ring_impact_marker(target, viewport, mob_array, center_x, center_y,
+                ring.radius, age, pulse_duration, ring.color, ring.indicator_style,
+                center_target_by_id || center_target_by_index);
+        }
+    }
+
+    void draw_projected_ring(const D3DVIEWPORT8& viewport, float center_x, float center_y, float center_z, float radius, float thickness, DWORD color) {
+        constexpr int segments = 72;
+        DrawVertex vertices[segments * 6] {};
+        int vertex_count = 0;
+        float previous_x = 0.0f;
+        float previous_y = 0.0f;
+        bool previous_ok = false;
+
+        for (int i = 0; i <= segments; ++i) {
+            const float angle = (static_cast<float>(i) / static_cast<float>(segments)) * 6.28318530718f;
+            const float world_x = center_x + std::cos(angle) * radius;
+            const float world_y = center_y + std::sin(angle) * radius;
+            float screen_x = 0.0f;
+            float screen_y = 0.0f;
+            const bool ok = live_world_to_screen(world_x, world_y, center_z, viewport, screen_x, screen_y);
+            if (ok && previous_ok && vertex_count <= (segments * 6 - 6)) {
+                const float segment_dx = screen_x - previous_x;
+                const float segment_dy = screen_y - previous_y;
+                const float segment_length = std::sqrt(segment_dx * segment_dx + segment_dy * segment_dy);
+                if (segment_length > 0.01f) {
+                    append_segment_quad_with_normal(vertices, vertex_count, previous_x, previous_y,
+                        screen_x, screen_y, -segment_dy / segment_length, segment_dx / segment_length,
+                        thickness, color);
+                }
+            }
+
+            previous_x = screen_x;
+            previous_y = screen_y;
+            previous_ok = ok;
+        }
+
+        if (vertex_count > 0) {
+            draw_vertices(D3DPT_TRIANGLELIST, vertex_count / 3, vertices, sizeof(DrawVertex));
+        }
+    }
+
+    void draw_projected_comet_arc(const D3DVIEWPORT8& viewport, float center_x, float center_y, float center_z,
+        float radius, float thickness, DWORD glow_color, DWORD backing_color, DWORD core_color, DWORD shine_color,
+        float head_phase, float tail_extent, float head_extent) {
+        constexpr int max_segments = 72;
+        const float total_extent = std::fmax(tail_extent + head_extent, 0.02f);
+        const float tail_fraction = std::fmax(0.0f, tail_extent) / total_extent;
+        const int segments = std::max(8, std::min(max_segments,
+            static_cast<int>(std::ceil(total_extent / 6.28318530718f * static_cast<float>(max_segments)))));
+        DrawVertex glow_vertices[max_segments * 6] {};
+        DrawVertex backing_vertices[max_segments * 6] {};
+        DrawVertex core_vertices[max_segments * 6] {};
+        DrawVertex shine_vertices[max_segments * 6] {};
+        int glow_vertex_count = 0;
+        int backing_vertex_count = 0;
+        int core_vertex_count = 0;
+        int shine_vertex_count = 0;
+
+        for (int i = 0; i < segments; ++i) {
+            const float u0 = static_cast<float>(i) / static_cast<float>(segments);
+            const float u1 = static_cast<float>(i + 1) / static_cast<float>(segments);
+            const float middle_u = (u0 + u1) * 0.5f;
+            const float angle0 = head_phase - total_extent + total_extent * u0;
+            const float angle1 = head_phase - total_extent + total_extent * u1;
+            float screen_x0 = 0.0f;
+            float screen_y0 = 0.0f;
+            float screen_x1 = 0.0f;
+            float screen_y1 = 0.0f;
+            if (!live_world_to_screen(center_x + std::cos(angle0) * radius, center_y + std::sin(angle0) * radius,
+                    center_z, viewport, screen_x0, screen_y0)
+                || !live_world_to_screen(center_x + std::cos(angle1) * radius, center_y + std::sin(angle1) * radius,
+                    center_z, viewport, screen_x1, screen_y1)) {
+                continue;
+            }
+
+            float intensity = 1.0f;
+            float width_scale = 1.0f;
+            if (middle_u < tail_fraction) {
+                const float tail_t = middle_u / tail_fraction;
+                intensity = 0.10f + 0.90f * tail_t * tail_t;
+                width_scale = 0.28f + 0.72f * tail_t;
+            }
+
+            const float segment_dx = screen_x1 - screen_x0;
+            const float segment_dy = screen_y1 - screen_y0;
+            const float segment_length = std::sqrt(segment_dx * segment_dx + segment_dy * segment_dy);
+            if (segment_length <= 0.01f) {
+                continue;
+            }
+            const float normal_x = -segment_dy / segment_length;
+            const float normal_y = segment_dx / segment_length;
+            append_segment_quad_with_normal(glow_vertices, glow_vertex_count, screen_x0, screen_y0, screen_x1, screen_y1,
+                normal_x, normal_y, thickness * 2.35f * width_scale, scale_alpha(glow_color, intensity));
+            append_segment_quad_with_normal(backing_vertices, backing_vertex_count, screen_x0, screen_y0, screen_x1, screen_y1,
+                normal_x, normal_y, thickness * 1.70f * width_scale, scale_alpha(backing_color, intensity));
+            append_segment_quad_with_normal(core_vertices, core_vertex_count, screen_x0, screen_y0, screen_x1, screen_y1,
+                normal_x, normal_y, thickness * width_scale, scale_alpha(core_color, intensity));
+            if (middle_u >= 0.86f) {
+                const float shine_t = (middle_u - 0.86f) / 0.14f;
+                append_segment_quad_with_normal(shine_vertices, shine_vertex_count, screen_x0, screen_y0, screen_x1, screen_y1,
+                    normal_x, normal_y, std::fmax(1.25f, thickness * 0.32f), scale_alpha(shine_color, shine_t));
+            }
+        }
+
+        if (glow_vertex_count > 0) {
+            draw_vertices(D3DPT_TRIANGLELIST, glow_vertex_count / 3, glow_vertices, sizeof(DrawVertex));
+        }
+        if (backing_vertex_count > 0) {
+            draw_vertices(D3DPT_TRIANGLELIST, backing_vertex_count / 3, backing_vertices, sizeof(DrawVertex));
+        }
+        if (core_vertex_count > 0) {
+            draw_vertices(D3DPT_TRIANGLELIST, core_vertex_count / 3, core_vertices, sizeof(DrawVertex));
+        }
+        if (shine_vertex_count > 0) {
+            draw_vertices(D3DPT_TRIANGLELIST, shine_vertex_count / 3, shine_vertices, sizeof(DrawVertex));
+        }
+    }
+
+    void draw_ring_impact_marker(const RingTargetState& target, const D3DVIEWPORT8& viewport, std::uintptr_t mob_array,
+        float center_x, float center_y, float ring_radius, float ring_age, float pulse_duration, DWORD color,
+        int indicator_style, bool center_target) {
+        float target_x = target.x;
+        float target_y = target.y;
+        const float target_height = model_adjusted_height(target_height_offset_, target.model_size, target.model_scale,
+            target.short_anchor, target.floating_anchor, target.is_npc);
+        float target_z = target.z + target_height;
+        resolve_live_anchor_cached(mob_array, target.is_npc, target.index,
+            dynamic_bone_, target_height, target_x, target_y, target_z);
+
+        const float target_scale = target.model_scale > 0.0f ? target.model_scale : 1.0f;
+        const float effective_size = std::fmax(0.0f, target.model_size * target_scale);
+        const float halo_radius = std::fmax(0.80f, std::fmin(0.75f + effective_size * 0.18f, 1.35f));
+
+        const float dx = target_x - center_x;
+        const float dy = target_y - center_y;
+        float distance_ratio = std::fmax(0.0f,
+            std::fmin(std::sqrt(dx * dx + dy * dy) / std::fmax(ring_radius, 0.1f), 1.0f));
+        if (center_target) {
+            // Do not start the center marker inside the expanding pulse. Treat it
+            // as though it were at the radius needed for the pulse to clear the
+            // complete marker, while preserving normal arrival timing elsewhere.
+            const float clearance_scale = indicator_style == 10 ? 1.75f : 1.35f;
+            const float clearance_ratio = std::fmax(0.0f,
+                std::fmin((halo_radius * clearance_scale) / std::fmax(ring_radius, 0.1f), 1.0f));
+            distance_ratio = std::fmax(distance_ratio, clearance_ratio);
+        }
+        constexpr float pulse_start_scale = 0.08f;
+        const float wave_ratio = std::fmax(0.0f, std::fmin((distance_ratio - pulse_start_scale) / (1.0f - pulse_start_scale), 1.0f));
+        const float arrival_t = 1.0f - std::pow(std::fmax(0.0f, 1.0f - wave_ratio), 2.0f / 3.0f);
+        const float marker_age = ring_age - pulse_duration * arrival_t;
+        if (marker_age < 0.0f || marker_age > ring_marker_duration_) {
+            return;
+        }
+
+        const float marker_t = std::fmax(0.0f, std::fmin(marker_age / ring_marker_duration_, 1.0f));
+        const float attack = std::fmin(marker_age / 0.10f, 1.0f);
+        const float fade_start = ring_marker_duration_ * 0.55f;
+        const float fade = marker_age <= fade_start ? 1.0f
+            : 1.0f - std::fmax(0.0f, std::fmin((marker_age - fade_start)
+                / std::fmax(ring_marker_duration_ - fade_start, 0.1f), 1.0f));
+        const float alpha = attack * fade * opacity_scale_;
+        if (alpha <= 0.01f) {
+            return;
+        }
+
+        const float line_core_thickness = 10.5f * width_scale_;
+        const DWORD saturated_color = saturate_color(color);
+
+        const float halo_phase = marker_t * 3.49065850399f;
+        const DWORD halo_backing_color = scale_alpha(darken_color(saturated_color), 0.82f * alpha);
+        const DWORD halo_glow_color = scale_alpha(saturated_color, 0.26f * alpha);
+        const DWORD halo_core_color = scale_alpha(saturated_color, 1.10f * alpha);
+        const DWORD halo_shine_color = scale_alpha(tint_white_color(saturated_color, 0.72f), 1.08f * alpha);
+
+        const float halo_thickness = std::fmax(4.0f, line_core_thickness * 0.52f);
+        if (indicator_style == 10) {
+            const float contract_t = marker_t * marker_t * (3.0f - 2.0f * marker_t);
+            const float contract_radius = halo_radius * (1.45f - 0.75f * contract_t);
+            draw_projected_ring(viewport, target_x, target_y, target_z, contract_radius,
+                halo_thickness * 1.65f, halo_glow_color);
+            draw_projected_ring(viewport, target_x, target_y, target_z, contract_radius,
+                halo_thickness * 1.22f, halo_backing_color);
+            draw_projected_ring(viewport, target_x, target_y, target_z, contract_radius,
+                halo_thickness * 0.62f, halo_core_color);
+        } else {
+            draw_projected_comet_arc(viewport, target_x, target_y, target_z, halo_radius,
+                halo_thickness, halo_glow_color, halo_backing_color, halo_core_color,
+                halo_shine_color, halo_phase, 5.58505360638f, 0.69813170080f);
+        }
+    }
+
     bool same_target(const LineState& left, const LineState& right) const {
         if (left.target_id != 0 && right.target_id != 0) {
             return left.target_id == right.target_id;
@@ -1316,6 +1629,39 @@ private:
         return &active;
     }
 
+    ActiveRing* find_active_ring(unsigned long long key) {
+        for (int i = 0; i < active_ring_count_; ++i) {
+            if (active_rings_[i].key == key) {
+                return &active_rings_[i];
+            }
+        }
+
+        return nullptr;
+    }
+
+    ActiveRing* allocate_active_ring(unsigned long long key, DWORD now_ms) {
+        if (active_ring_count_ < max_active_rings_) {
+            ActiveRing& active = active_rings_[active_ring_count_++];
+            active.key = key;
+            active.start_ms = now_ms;
+            active.last_seen_ms = now_ms;
+            return &active;
+        }
+
+        int oldest = 0;
+        for (int i = 1; i < active_ring_count_; ++i) {
+            if (active_rings_[i].last_seen_ms < active_rings_[oldest].last_seen_ms) {
+                oldest = i;
+            }
+        }
+
+        ActiveRing& active = active_rings_[oldest];
+        active.key = key;
+        active.start_ms = now_ms;
+        active.last_seen_ms = now_ms;
+        return &active;
+    }
+
     void prune_active_lines(DWORD now_ms) {
         int write = 0;
         for (int read = 0; read < active_line_count_; ++read) {
@@ -1328,6 +1674,20 @@ private:
         }
 
         active_line_count_ = write;
+    }
+
+    void prune_active_rings(DWORD now_ms) {
+        int write = 0;
+        for (int read = 0; read < active_ring_count_; ++read) {
+            if (now_ms - active_rings_[read].last_seen_ms <= 5000) {
+                if (write != read) {
+                    active_rings_[write] = active_rings_[read];
+                }
+                ++write;
+            }
+        }
+
+        active_ring_count_ = write;
     }
 
     DWORD scale_alpha(DWORD color, float scale) {
@@ -1918,13 +2278,20 @@ private:
     }
 
     int read_lines(LineState* lines, int max_lines) {
+        return read_state(lines, max_lines, nullptr, 0);
+    }
+
+    int read_state(LineState* lines, int max_lines, RingState* rings, int max_rings) {
         if (!state_file_may_have_changed()) {
-            return copy_cached_lines(lines, max_lines);
+            return copy_cached_state(lines, max_lines, rings, max_rings);
         }
 
         WIN32_FILE_ATTRIBUTE_DATA attributes_before {};
         if (!GetFileAttributesExA(state_path_, GetFileExInfoStandard, &attributes_before)) {
             state_cache_valid_ = false;
+            cached_line_count_ = 0;
+            cached_ring_count_ = 0;
+            last_ring_count_ = 0;
             return 0;
         }
 
@@ -1938,12 +2305,12 @@ private:
         if (state_cache_valid_
             && cached_state_write_time_ == write_time_before.QuadPart
             && cached_state_file_size_ == file_size_before) {
-            return copy_cached_lines(lines, max_lines);
+            return copy_cached_state(lines, max_lines, rings, max_rings);
         }
 
         FILE* file = std::fopen(state_path_, "rb");
         if (!file) {
-            return state_cache_valid_ ? copy_cached_lines(lines, max_lines) : 0;
+            return state_cache_valid_ ? copy_cached_state(lines, max_lines, rings, max_rings) : 0;
         }
 
         char buffer[131072] {};
@@ -1958,12 +2325,10 @@ private:
         }
         if (file_size_before >= sizeof(buffer) || content_end == 0 || buffer[0] != '{'
             || buffer[content_end - 1] != '}') {
-            return state_cache_valid_ ? copy_cached_lines(lines, max_lines) : 0;
+            return state_cache_valid_ ? copy_cached_state(lines, max_lines, rings, max_rings) : 0;
         }
 
-        const bool has_lines = std::strstr(buffer, "\"source\"") != nullptr;
-
-        const char* settings = has_lines ? std::strstr(buffer, "\"settings\"") : nullptr;
+        const char* settings = std::strstr(buffer, "\"settings\"");
         if (settings) {
             const float opacity = parse_json_float(settings, "\"opacity\"");
             if (opacity >= 0.0f && opacity <= 1.0f) {
@@ -1989,14 +2354,21 @@ private:
         boneprobe_requested_ = std::strstr(buffer, "\"boneprobe\":true") != nullptr;
 
         LineState parsed_lines[128] {};
+        RingState parsed_rings[max_rings_per_state_] {};
         int count = 0;
         const int render_limit = std::min(max_lines, 16);
-        const char* lines_array = has_lines ? std::strstr(buffer, "\"lines\"") : nullptr;
-        if (lines_array) {
+        const char* lines_array = std::strstr(buffer, "\"lines\"");
+        if (lines && render_limit > 0 && lines_array) {
             count = parse_line_array(lines_array, parsed_lines, render_limit);
         }
 
-        if (count == 0) {
+        int ring_count = 0;
+        const char* rings_array = std::strstr(buffer, "\"rings\"");
+        if (rings_array) {
+            ring_count = parse_ring_array(rings_array, parsed_rings, max_rings_per_state_);
+        }
+
+        if (count == 0 && lines && render_limit > 0) {
             const char* probe_lines_array = std::strstr(buffer, "\"probe_lines\"");
             if (probe_lines_array) {
                 count = parse_line_array(probe_lines_array, parsed_lines, render_limit);
@@ -2006,6 +2378,10 @@ private:
         cached_line_count_ = std::min(count, 128);
         for (int i = 0; i < cached_line_count_; ++i) {
             cached_lines_[i] = parsed_lines[i];
+        }
+        cached_ring_count_ = std::min(ring_count, max_rings_per_state_);
+        for (int i = 0; i < cached_ring_count_; ++i) {
+            cached_rings_[i] = parsed_rings[i];
         }
         state_cache_valid_ = true;
 
@@ -2024,13 +2400,18 @@ private:
             }
         }
 
-        return copy_cached_lines(lines, max_lines);
+        return copy_cached_state(lines, max_lines, rings, max_rings);
     }
 
-    int copy_cached_lines(LineState* lines, int max_lines) const {
-        const int count = std::min(cached_line_count_, max_lines);
+    int copy_cached_state(LineState* lines, int max_lines, RingState* rings, int max_rings) {
+        const int count = lines && max_lines > 0 ? std::min(cached_line_count_, max_lines) : 0;
         for (int i = 0; i < count; ++i) {
             lines[i] = cached_lines_[i];
+        }
+
+        last_ring_count_ = rings && max_rings > 0 ? std::min(cached_ring_count_, max_rings) : 0;
+        for (int i = 0; i < last_ring_count_; ++i) {
+            rings[i] = cached_rings_[i];
         }
         return count;
     }
@@ -2114,6 +2495,147 @@ private:
 
             ++count;
             cursor = target + 8;
+        }
+
+        return count;
+    }
+
+    const char* find_json_closing(const char* opening, char open_character, char close_character) const {
+        if (!opening || *opening != open_character) {
+            return nullptr;
+        }
+
+        int depth = 0;
+        bool in_string = false;
+        bool escaped = false;
+        for (const char* cursor = opening; *cursor; ++cursor) {
+            const char character = *cursor;
+            if (in_string) {
+                if (escaped) {
+                    escaped = false;
+                } else if (character == '\\') {
+                    escaped = true;
+                } else if (character == '"') {
+                    in_string = false;
+                }
+                continue;
+            }
+
+            if (character == '"') {
+                in_string = true;
+            } else if (character == open_character) {
+                ++depth;
+            } else if (character == close_character) {
+                // Return the delimiter that closes the original object/array.
+                // Nested point objects and target arrays are skipped by depth.
+                // The state JSON is generated locally, so mismatched delimiters
+                // simply make the current entry unreadable rather than unsafe.
+                //
+                // Keep this parser allocation-free for the render thread.
+                --depth;
+                if (depth == 0) {
+                    return cursor;
+                }
+            }
+        }
+
+        return nullptr;
+    }
+
+    int parse_ring_array(const char* array_start, RingState* rings, int max_rings) {
+        const char* array_open = array_start ? std::strchr(array_start, '[') : nullptr;
+        const char* array_end = find_json_closing(array_open, '[', ']');
+        if (!array_open || !array_end) {
+            return 0;
+        }
+
+        int count = 0;
+        const char* cursor = array_open + 1;
+        while (count < max_rings && cursor < array_end) {
+            const char* object_open = std::strchr(cursor, '{');
+            if (!object_open || object_open >= array_end) {
+                break;
+            }
+
+            const char* object_end = find_json_closing(object_open, '{', '}');
+            if (!object_end || object_end > array_end) {
+                break;
+            }
+
+            const char* center = std::strstr(object_open, "\"center\"");
+            if (!center || center >= object_end) {
+                cursor = object_end + 1;
+                continue;
+            }
+
+            RingState& ring = rings[count];
+            ring.uid = parse_json_uint(object_open, "\"uid\"");
+            ring.center_id = parse_json_uint(center, "\"id\"");
+            ring.center_index = parse_json_uint(center, "\"index\"");
+            ring.center_x = parse_json_float(center, "\"x\"");
+            ring.center_y = parse_json_float(center, "\"y\"");
+            ring.center_z = parse_json_float(center, "\"z\"");
+            ring.center_model_size = parse_json_float(center, "\"model_size\"");
+            ring.center_model_scale = parse_json_float(center, "\"model_scale\"");
+            if (ring.center_model_scale <= 0.0f) {
+                ring.center_model_scale = 1.0f;
+            }
+            ring.center_short_anchor = parse_json_bool(center, "\"short_anchor\"");
+            ring.center_floating_anchor = parse_json_bool(center, "\"floating_anchor\"");
+            ring.center_is_npc = parse_json_bool(center, "\"npc\"");
+            ring.radius = parse_json_float(center, "\"radius\"");
+            ring.color = parse_json_uint(center, "\"color\"");
+            if (ring.color == 0) {
+                ring.color = 0xEFFFFFFF;
+            }
+            ring.timeout = parse_json_float(center, "\"timeout\"");
+            if (ring.timeout <= 0.0f) {
+                ring.timeout = 1.5f;
+            }
+            ring.indicator_style = static_cast<int>(parse_json_uint(object_open, "\"indicator_style\""));
+            if (ring.indicator_style != 1 && ring.indicator_style != 10) {
+                ring.indicator_style = 1;
+            }
+
+            ring.target_count = 0;
+            const char* targets_key = std::strstr(center, "\"targets\"");
+            if (targets_key && targets_key < object_end) {
+                const char* targets_open = std::strchr(targets_key, '[');
+                const char* targets_end = find_json_closing(targets_open, '[', ']');
+                if (targets_open && targets_end && targets_end < object_end) {
+                    const char* target_cursor = targets_open + 1;
+                    while (ring.target_count < max_ring_targets_per_ring_ && target_cursor < targets_end) {
+                        const char* target_open = std::strchr(target_cursor, '{');
+                        if (!target_open || target_open >= targets_end) {
+                            break;
+                        }
+
+                        const char* target_end = find_json_closing(target_open, '{', '}');
+                        if (!target_end || target_end > targets_end) {
+                            break;
+                        }
+
+                        RingTargetState& target = ring.targets[ring.target_count++];
+                        target.id = parse_json_uint(target_open, "\"id\"");
+                        target.index = parse_json_uint(target_open, "\"index\"");
+                        target.x = parse_json_float(target_open, "\"x\"");
+                        target.y = parse_json_float(target_open, "\"y\"");
+                        target.z = parse_json_float(target_open, "\"z\"");
+                        target.model_size = parse_json_float(target_open, "\"model_size\"");
+                        target.model_scale = parse_json_float(target_open, "\"model_scale\"");
+                        if (target.model_scale <= 0.0f) {
+                            target.model_scale = 1.0f;
+                        }
+                        target.short_anchor = parse_json_bool(target_open, "\"short_anchor\"");
+                        target.floating_anchor = parse_json_bool(target_open, "\"floating_anchor\"");
+                        target.is_npc = parse_json_bool(target_open, "\"npc\"");
+                        target_cursor = target_end + 1;
+                    }
+                }
+            }
+
+            ++count;
+            cursor = object_end + 1;
         }
 
         return count;
@@ -2548,6 +3070,7 @@ private:
     char log_path_[1024] {};
     HANDLE state_change_notification_ = INVALID_HANDLE_VALUE;
     unsigned long postrender_calls_ = 0;
+    int last_ring_count_ = 0;
     IDirect3DDevice8* d3d_device_ = nullptr;
     D3DMATRIX cached_view_ {};
     D3DMATRIX cached_projection_ {};
@@ -2578,6 +3101,8 @@ private:
     int dynamic_bone_ = 21;
     LineState cached_lines_[128] {};
     int cached_line_count_ = 0;
+    RingState cached_rings_[max_rings_per_state_] {};
+    int cached_ring_count_ = 0;
     unsigned long long cached_state_write_time_ = 0;
     unsigned long long cached_state_file_size_ = 0;
     bool state_cache_valid_ = false;
@@ -2593,6 +3118,9 @@ private:
     static constexpr int max_active_lines_ = 128;
     ActiveLine active_lines_[max_active_lines_] {};
     int active_line_count_ = 0;
+    static constexpr int max_active_rings_ = 32;
+    ActiveRing active_rings_[max_active_rings_] {};
+    int active_ring_count_ = 0;
 };
 
 std::uint32_t GetInterfaceVersion() {
