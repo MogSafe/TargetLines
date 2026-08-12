@@ -81,6 +81,7 @@ public:
     void __stdcall Load(PluginManager* manager) override {
         plugin_manager_ = manager;
         QueryPerformanceFrequency(&performance_frequency_);
+        initialize_geometry_tables();
         append_module_log("Load called");
         initialize_paths_from_module();
         append_log("loaded");
@@ -122,7 +123,7 @@ public:
 
         if (std::strcmp(command, "renderstats") == 0) {
             char message[512] {};
-            std::snprintf(message, sizeof(message), "postrender_calls=%lu last_line_count=%d", postrender_calls_, last_line_count_);
+            std::snprintf(message, sizeof(message), "postrender_calls=%lu cached_line_count=%d", postrender_calls_, cached_line_count_);
             append_log(message);
             return;
         }
@@ -284,13 +285,6 @@ public:
         projection_matrices_valid_ = false;
 
         ++postrender_calls_;
-
-        if (postrender_calls_ == 1 || (postrender_calls_ % 300) == 0) {
-            last_line_count_ = count_lines();
-            char message[512] {};
-            std::snprintf(message, sizeof(message), "postrender heartbeat calls=%lu lines=%d", postrender_calls_, last_line_count_);
-            append_log(message);
-        }
 
         if (debug_bar_enabled_) {
             draw_test_bar();
@@ -772,6 +766,24 @@ private:
         DWORD color;
     };
 
+    static constexpr int head_marker_slices_ = 36;
+    static constexpr int round_cap_slices_ = 24;
+
+    void initialize_geometry_tables() {
+        for (int i = 0; i <= head_marker_slices_; ++i) {
+            const float angle = 6.28318530718f * static_cast<float>(i) / static_cast<float>(head_marker_slices_);
+            head_unit_x_[i] = std::cos(angle);
+            head_unit_y_[i] = std::sin(angle);
+        }
+
+        for (int i = 0; i <= round_cap_slices_; ++i) {
+            const float angle = -1.57079632679f
+                + 3.14159265359f * static_cast<float>(i) / static_cast<float>(round_cap_slices_);
+            cap_unit_x_[i] = std::cos(angle);
+            cap_unit_y_[i] = std::sin(angle);
+        }
+    }
+
     void draw_test_bar() {
         DrawVertex vertices[] = {
             {80.0f, 80.0f, 0.0f, 1.0f, 0xCCFF3030},
@@ -817,6 +829,15 @@ private:
         bool spread_target = false;
     };
 
+    struct AnchorCacheEntry {
+        DWORD index = 0;
+        int bone = -1;
+        bool resolved = false;
+        float x = 0.0f;
+        float y = 0.0f;
+        float z = 0.0f;
+    };
+
     void draw_lines() {
         LineState lines[128] {};
         const int line_count = read_lines(lines, 128);
@@ -848,6 +869,7 @@ private:
         if (dynamic_bone_ >= 0) {
             get_luacore_mob_array(mob_array, nullptr, nullptr);
         }
+        anchor_cache_count_ = 0;
 
         if (!begin_draw_state()) {
             return;
@@ -948,8 +970,8 @@ private:
         float p2_y = line.target_y;
         float p2_z = line.target_z + model_adjusted_height(target_height_offset_, line.target_model_size, line.target_model_scale, line.target_short_anchor, line.target_floating_anchor, line.target_is_npc);
         if (dynamic_bone_ >= 0) {
-            resolve_dynamic_anchor(mob_array, line.source_is_npc, line.source_index, dynamic_bone_, p0_x, p0_y, p0_z);
-            resolve_dynamic_anchor(mob_array, line.target_is_npc, line.target_index, dynamic_bone_, p2_x, p2_y, p2_z);
+            resolve_dynamic_anchor_cached(mob_array, line.source_is_npc, line.source_index, dynamic_bone_, p0_x, p0_y, p0_z);
+            resolve_dynamic_anchor_cached(mob_array, line.target_is_npc, line.target_index, dynamic_bone_, p2_x, p2_y, p2_z);
         }
         if (spread_source) {
             apply_source_spread(line, p0_x, p0_y);
@@ -1360,12 +1382,7 @@ private:
     }
 
     float directional_head_fade(float unit_x, float unit_y, float direction_x, float direction_y, float landing_t) const {
-        const float direction_length = std::sqrt(direction_x * direction_x + direction_y * direction_y);
-        if (direction_length <= 0.001f) {
-            return 1.0f - landing_t * 0.72f;
-        }
-
-        const float dot = (unit_x * direction_x + unit_y * direction_y) / direction_length;
+        const float dot = unit_x * direction_x + unit_y * direction_y;
         const float target_side = std::fmax(0.0f, std::fmin((dot + 1.0f) * 0.5f, 1.0f));
         const float target_absorb = landing_t * landing_t * (3.0f - 2.0f * landing_t);
         const float front_fade = 1.0f - target_absorb * (0.30f + target_side * 0.68f);
@@ -1373,8 +1390,7 @@ private:
     }
 
     void draw_head_marker(float center_x, float center_y, float radius, DWORD haze_color_base, DWORD core_color, DWORD shine_color, float direction_x, float direction_y, float landing_t, float base_alpha) {
-        constexpr int slices = 36;
-        DrawVertex vertices[slices * 9] {};
+        DrawVertex vertices[head_marker_slices_ * 9] {};
         int vertex_count = 0;
         const DWORD outer_color = scale_alpha(core_color, 0.86f * base_alpha);
         const DWORD inner_color = scale_alpha(core_color, 1.16f * base_alpha);
@@ -1387,13 +1403,11 @@ private:
         const DWORD hot_center_color = scale_alpha(hot_color, directional_head_fade(0.0f, 0.0f, direction_x, direction_y, landing_t));
         (void)haze_color_base;
 
-        for (int i = 0; i < slices; ++i) {
-            const float a0 = 6.28318530718f * static_cast<float>(i) / static_cast<float>(slices);
-            const float a1 = 6.28318530718f * static_cast<float>(i + 1) / static_cast<float>(slices);
-            const float x0 = std::cos(a0);
-            const float y0 = std::sin(a0);
-            const float x1 = std::cos(a1);
-            const float y1 = std::sin(a1);
+        for (int i = 0; i < head_marker_slices_; ++i) {
+            const float x0 = head_unit_x_[i];
+            const float y0 = head_unit_y_[i];
+            const float x1 = head_unit_x_[i + 1];
+            const float y1 = head_unit_y_[i + 1];
             const float fade0 = directional_head_fade(x0, y0, direction_x, direction_y, landing_t);
             const float fade1 = directional_head_fade(x1, y1, direction_x, direction_y, landing_t);
 
@@ -1414,24 +1428,24 @@ private:
     }
 
     void draw_round_line_cap(float center_x, float center_y, float direction_x, float direction_y, float radius, DWORD color) {
-        constexpr int slices = 24;
-        DrawVertex vertices[slices * 3] {};
+        DrawVertex vertices[round_cap_slices_ * 3] {};
         int vertex_count = 0;
         const float length = std::sqrt(direction_x * direction_x + direction_y * direction_y);
         if (radius <= 0.1f || length <= 0.001f) {
             return;
         }
 
-        const float angle = std::atan2(direction_y / length, direction_x / length);
-        const float start = angle - 1.57079632679f;
-        const float step = 3.14159265359f / static_cast<float>(slices);
+        const float unit_direction_x = direction_x / length;
+        const float unit_direction_y = direction_y / length;
 
-        for (int i = 0; i < slices; ++i) {
-            const float a0 = start + step * static_cast<float>(i);
-            const float a1 = start + step * static_cast<float>(i + 1);
+        for (int i = 0; i < round_cap_slices_; ++i) {
+            const float x0 = unit_direction_x * cap_unit_x_[i] - unit_direction_y * cap_unit_y_[i];
+            const float y0 = unit_direction_y * cap_unit_x_[i] + unit_direction_x * cap_unit_y_[i];
+            const float x1 = unit_direction_x * cap_unit_x_[i + 1] - unit_direction_y * cap_unit_y_[i + 1];
+            const float y1 = unit_direction_y * cap_unit_x_[i + 1] + unit_direction_x * cap_unit_y_[i + 1];
             vertices[vertex_count++] = DrawVertex {center_x, center_y, 0.0f, 1.0f, color};
-            vertices[vertex_count++] = DrawVertex {center_x + std::cos(a0) * radius, center_y + std::sin(a0) * radius, 0.0f, 1.0f, color};
-            vertices[vertex_count++] = DrawVertex {center_x + std::cos(a1) * radius, center_y + std::sin(a1) * radius, 0.0f, 1.0f, color};
+            vertices[vertex_count++] = DrawVertex {center_x + x0 * radius, center_y + y0 * radius, 0.0f, 1.0f, color};
+            vertices[vertex_count++] = DrawVertex {center_x + x1 * radius, center_y + y1 * radius, 0.0f, 1.0f, color};
         }
 
         draw_vertices(D3DPT_TRIANGLELIST, vertex_count / 3, vertices, sizeof(DrawVertex));
@@ -2232,8 +2246,61 @@ private:
             return false;
         }
 
+        for (int row = 0; row < 4; ++row) {
+            for (int column = 0; column < 4; ++column) {
+                cached_view_projection_.m[row][column] =
+                    cached_view_.m[row][0] * cached_projection_.m[0][column]
+                    + cached_view_.m[row][1] * cached_projection_.m[1][column]
+                    + cached_view_.m[row][2] * cached_projection_.m[2][column]
+                    + cached_view_.m[row][3] * cached_projection_.m[3][column];
+            }
+        }
+
         projection_matrices_valid_ = true;
         return true;
+    }
+
+    bool resolve_dynamic_anchor_cached(std::uintptr_t mob_array, bool is_npc, DWORD index, int bone,
+        float& lua_x, float& lua_y, float& lua_z) {
+        if (mob_array == 0 || !is_npc || index == 0 || index >= 0x900) {
+            return false;
+        }
+
+        for (int i = 0; i < anchor_cache_count_; ++i) {
+            const AnchorCacheEntry& entry = anchor_cache_[i];
+            if (entry.index != index || entry.bone != bone) {
+                continue;
+            }
+
+            if (entry.resolved) {
+                lua_x = entry.x;
+                lua_y = entry.y;
+                lua_z = entry.z;
+            }
+            return entry.resolved;
+        }
+
+        float resolved_x = lua_x;
+        float resolved_y = lua_y;
+        float resolved_z = lua_z;
+        const bool resolved = resolve_dynamic_anchor(mob_array, is_npc, index, bone,
+            resolved_x, resolved_y, resolved_z);
+        if (anchor_cache_count_ < max_anchor_cache_entries_) {
+            AnchorCacheEntry& entry = anchor_cache_[anchor_cache_count_++];
+            entry.index = index;
+            entry.bone = bone;
+            entry.resolved = resolved;
+            entry.x = resolved_x;
+            entry.y = resolved_y;
+            entry.z = resolved_z;
+        }
+
+        if (resolved) {
+            lua_x = resolved_x;
+            lua_y = resolved_y;
+            lua_z = resolved_z;
+        }
+        return resolved;
     }
 
     bool live_world_to_screen(float lua_x, float lua_y, float lua_z, const D3DVIEWPORT8& viewport, float& screen_x, float& screen_y) {
@@ -2244,8 +2311,7 @@ private:
             return false;
         }
 
-        const D3DMATRIX& view = cached_view_;
-        const D3DMATRIX& projection = cached_projection_;
+        const D3DMATRIX& view_projection = cached_view_projection_;
 
         // FFXI Lua positions use x/y as ground-plane coordinates and z as height.
         // D3D's observed model translations map those to x/z ground-plane and y height.
@@ -2253,14 +2319,12 @@ private:
         const float world_y = lua_z;
         const float world_z = lua_y;
 
-        const float view_x = world_x * view.m[0][0] + world_y * view.m[1][0] + world_z * view.m[2][0] + view.m[3][0];
-        const float view_y = world_x * view.m[0][1] + world_y * view.m[1][1] + world_z * view.m[2][1] + view.m[3][1];
-        const float view_z = world_x * view.m[0][2] + world_y * view.m[1][2] + world_z * view.m[2][2] + view.m[3][2];
-        const float view_w = world_x * view.m[0][3] + world_y * view.m[1][3] + world_z * view.m[2][3] + view.m[3][3];
-
-        const float clip_x = view_x * projection.m[0][0] + view_y * projection.m[1][0] + view_z * projection.m[2][0] + view_w * projection.m[3][0];
-        const float clip_y = view_x * projection.m[0][1] + view_y * projection.m[1][1] + view_z * projection.m[2][1] + view_w * projection.m[3][1];
-        const float clip_w = view_x * projection.m[0][3] + view_y * projection.m[1][3] + view_z * projection.m[2][3] + view_w * projection.m[3][3];
+        const float clip_x = world_x * view_projection.m[0][0] + world_y * view_projection.m[1][0]
+            + world_z * view_projection.m[2][0] + view_projection.m[3][0];
+        const float clip_y = world_x * view_projection.m[0][1] + world_y * view_projection.m[1][1]
+            + world_z * view_projection.m[2][1] + view_projection.m[3][1];
+        const float clip_w = world_x * view_projection.m[0][3] + world_y * view_projection.m[1][3]
+            + world_z * view_projection.m[2][3] + view_projection.m[3][3];
 
         if (std::fabs(clip_w) <= 0.0001f) {
             return false;
@@ -2563,10 +2627,10 @@ private:
     char log_path_[1024] {};
     char benchmark_path_[1024] {};
     unsigned long postrender_calls_ = 0;
-    int last_line_count_ = 0;
     IDirect3DDevice8* d3d_device_ = nullptr;
     D3DMATRIX cached_view_ {};
     D3DMATRIX cached_projection_ {};
+    D3DMATRIX cached_view_projection_ {};
     bool projection_matrices_valid_ = false;
     DWORD saved_shader_ = 0;
     DWORD saved_alpha_ = 0;
@@ -2614,6 +2678,13 @@ private:
     bool state_cache_valid_ = false;
     bool boneprobe_requested_ = false;
     DWORD last_boneprobe_ms_ = 0;
+    static constexpr int max_anchor_cache_entries_ = 256;
+    AnchorCacheEntry anchor_cache_[max_anchor_cache_entries_] {};
+    int anchor_cache_count_ = 0;
+    float head_unit_x_[head_marker_slices_ + 1] {};
+    float head_unit_y_[head_marker_slices_ + 1] {};
+    float cap_unit_x_[round_cap_slices_ + 1] {};
+    float cap_unit_y_[round_cap_slices_ + 1] {};
     static constexpr int max_active_lines_ = 128;
     ActiveLine active_lines_[max_active_lines_] {};
     int active_line_count_ = 0;

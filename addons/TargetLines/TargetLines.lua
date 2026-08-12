@@ -123,6 +123,13 @@ local duplicate_finish_window = 5.0
 local auto_inspect_last = 0
 local auto_inspect_zone = nil
 local auto_inspect_zone_written = false
+local mob_snapshot = {}
+local nearby_snapshot = {}
+local active_id_snapshot = {}
+local mob_snapshot_time = -1
+local mob_snapshot_zone = nil
+local mob_snapshot_range = nil
+local mob_snapshot_interval = 0.25
 local native_probe_commands = {
     device = true,
     renderstats = true,
@@ -728,6 +735,40 @@ local function is_visible_npc(mob)
     return is_visible_entity(mob) and mob.is_npc
 end
 
+local function world_snapshot(force)
+    local now = os.clock()
+    local info = windower.ffxi.get_info() or {}
+    local zone = tonumber(info.zone) or 0
+    local range = tonumber(settings.scan_range) or defaults.scan_range
+    if force or mob_snapshot_time < 0 or now - mob_snapshot_time >= mob_snapshot_interval
+        or zone ~= mob_snapshot_zone or range ~= mob_snapshot_range then
+        local mobs = get_mobs()
+        local nearby = {}
+        local active_ids = {}
+        for _, mob in pairs(mobs) do
+            if is_visible_entity(mob) then
+                active_ids[mob.id] = true
+                if mob.is_npc and mob_distance(mob) <= range then
+                    nearby[#nearby + 1] = mob
+                end
+            end
+        end
+
+        table.sort(nearby, function(left, right)
+            return mob_distance(left) < mob_distance(right)
+        end)
+
+        mob_snapshot = mobs
+        nearby_snapshot = nearby
+        active_id_snapshot = active_ids
+        mob_snapshot_time = now
+        mob_snapshot_zone = zone
+        mob_snapshot_range = range
+    end
+
+    return mob_snapshot, nearby_snapshot, active_id_snapshot
+end
+
 local function first_nonzero(...)
     for index = 1, select('#', ...) do
         local value = select(index, ...)
@@ -1035,7 +1076,7 @@ local function add_recent_line(source, target, kind, color, timeout, options)
     return true, key
 end
 
-local function active_entity_ids(party)
+local function active_entity_ids(party, scanned_ids)
     local ids = {}
     for key in pairs(party or {}) do
         if type(key) == 'number' then
@@ -1043,17 +1084,15 @@ local function active_entity_ids(party)
         end
     end
 
-    for _, mob in pairs(get_mobs()) do
-        if is_visible_entity(mob) then
-            ids[mob.id] = true
-        end
+    for id in pairs(scanned_ids or {}) do
+        ids[id] = true
     end
 
     return ids
 end
 
-local function prune_seen_pairs_for_inactive_entities(party)
-    local active_ids = active_entity_ids(party)
+local function prune_seen_pairs_for_inactive_entities(party, scanned_ids)
+    local active_ids = active_entity_ids(party, scanned_ids)
     for key in pairs(seen_pairs) do
         local source_id, target_id = key:match('^(%d+)>(%d+)$')
         source_id = tonumber(source_id)
@@ -1318,13 +1357,17 @@ local function update_auto_inspect(nearby)
     end
 end
 
-local function collect_claim_lines(party)
+local function collect_claim_lines(party, mobs)
     local lines = {}
     local nearby = {}
+    local active_ids = {}
     local range = tonumber(settings.scan_range) or defaults.scan_range
     local colors = active_colors()
 
-    for _, mob in pairs(get_mobs()) do
+    for _, mob in pairs(mobs or {}) do
+        if is_visible_entity(mob) then
+            active_ids[mob.id] = true
+        end
         if is_visible_npc(mob) and mob_distance(mob) <= range then
             nearby[#nearby + 1] = mob
             if mob.claim_id and party[mob.claim_id] then
@@ -1347,7 +1390,7 @@ local function collect_claim_lines(party)
         return mob_distance(left) < mob_distance(right)
     end)
 
-    return lines, nearby
+    return lines, nearby, active_ids
 end
 
 local function collect_lines()
@@ -1366,27 +1409,21 @@ local function collect_lines()
     end
 
     local nearby = {}
+    local active_ids = {}
     if settings.claim_fallback then
         local claim_lines = nil
-        claim_lines, nearby = collect_claim_lines(party)
+        claim_lines, nearby, active_ids = collect_claim_lines(party, get_mobs())
         for _, line in ipairs(claim_lines) do
             lines[#lines + 1] = line
         end
     else
-        for _, mob in pairs(get_mobs()) do
-            if is_visible_npc(mob) and mob_distance(mob) <= (tonumber(settings.scan_range) or defaults.scan_range) then
-                nearby[#nearby + 1] = mob
-            end
-        end
-
-        table.sort(nearby, function(left, right)
-            return mob_distance(left) < mob_distance(right)
-        end)
+        local ignored_mobs = nil
+        ignored_mobs, nearby, active_ids = world_snapshot(false)
     end
 
     local regular = regular_mode()
     if regular == 'first' then
-        prune_seen_pairs_for_inactive_entities(party)
+        prune_seen_pairs_for_inactive_entities(party, active_ids)
     elseif regular == 'repeat' then
         local cooldown = tonumber(settings.pair_cooldown) or defaults.pair_cooldown
         for key, last_seen in pairs(seen_pairs) do
@@ -1608,7 +1645,11 @@ local function encode_state(lines)
         '"lines":[',
     }
 
+    local serialized_line_limit = benchmark_enabled() and 128 or 16
     for index, line in ipairs(lines) do
+        if index > serialized_line_limit then
+            break
+        end
         if index > 1 then
             parts[#parts + 1] = ','
         end
