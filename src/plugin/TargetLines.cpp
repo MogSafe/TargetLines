@@ -1052,10 +1052,32 @@ private:
             }
 
             const float segment_alpha = segment_alphas[i];
-            append_segment_quad(haze_vertices, haze_vertex_count, screen_xs[i - 1], screen_ys[i - 1], screen_xs[i], screen_ys[i], haze_thickness, scale_alpha(haze_color, segment_alpha), 0.0f);
-            append_segment_quad_clipped_to_circle(border_vertices, border_vertex_count, screen_xs[i - 1], screen_ys[i - 1], screen_xs[i], screen_ys[i], border_thickness, scale_alpha(border_color, segment_alpha), head_x, head_y, head_outer_radius * 0.72f);
-            append_segment_quad_clipped_to_circle(core_vertices, core_vertex_count, screen_xs[i - 1], screen_ys[i - 1], screen_xs[i], screen_ys[i], core_thickness, scale_alpha(core_color, segment_alpha), head_x, head_y, head_inner_radius * 0.82f);
-            append_segment_quad_clipped_to_circle(shine_vertices, shine_vertex_count, screen_xs[i - 1], screen_ys[i - 1], screen_xs[i], screen_ys[i], std::fmax(2.5f, core_thickness * 0.42f), scale_alpha(shine_color, segment_alpha), head_x, head_y, head_hot_radius * 0.92f);
+            const float x1 = screen_xs[i - 1];
+            const float y1 = screen_ys[i - 1];
+            const float x2 = screen_xs[i];
+            const float y2 = screen_ys[i];
+            const float segment_dx = x2 - x1;
+            const float segment_dy = y2 - y1;
+            const float segment_length_sq = segment_dx * segment_dx + segment_dy * segment_dy;
+            if (segment_length_sq <= 0.0001f) {
+                continue;
+            }
+            const float segment_length = std::sqrt(segment_length_sq);
+            const float normal_x = -segment_dy / segment_length;
+            const float normal_y = segment_dx / segment_length;
+
+            append_segment_quad_with_normal(haze_vertices, haze_vertex_count, x1, y1, x2, y2,
+                normal_x, normal_y, haze_thickness, scale_alpha(haze_color, segment_alpha));
+            append_segment_quad_clipped_to_circle(border_vertices, border_vertex_count, x1, y1, x2, y2,
+                segment_dx, segment_dy, segment_length, segment_length_sq, normal_x, normal_y,
+                border_thickness, scale_alpha(border_color, segment_alpha), head_x, head_y, head_outer_radius * 0.72f);
+            append_segment_quad_clipped_to_circle(core_vertices, core_vertex_count, x1, y1, x2, y2,
+                segment_dx, segment_dy, segment_length, segment_length_sq, normal_x, normal_y,
+                core_thickness, scale_alpha(core_color, segment_alpha), head_x, head_y, head_inner_radius * 0.82f);
+            append_segment_quad_clipped_to_circle(shine_vertices, shine_vertex_count, x1, y1, x2, y2,
+                segment_dx, segment_dy, segment_length, segment_length_sq, normal_x, normal_y,
+                std::fmax(2.5f, core_thickness * 0.42f), scale_alpha(shine_color, segment_alpha),
+                head_x, head_y, head_hot_radius * 0.92f);
         }
 
         if (haze_vertex_count > 0) {
@@ -1381,10 +1403,9 @@ private:
         return alpha | (red << 16) | (green << 8) | blue;
     }
 
-    float directional_head_fade(float unit_x, float unit_y, float direction_x, float direction_y, float landing_t) const {
+    float directional_head_fade(float unit_x, float unit_y, float direction_x, float direction_y, float target_absorb) const {
         const float dot = unit_x * direction_x + unit_y * direction_y;
         const float target_side = std::fmax(0.0f, std::fmin((dot + 1.0f) * 0.5f, 1.0f));
-        const float target_absorb = landing_t * landing_t * (3.0f - 2.0f * landing_t);
         const float front_fade = 1.0f - target_absorb * (0.30f + target_side * 0.68f);
         return std::fmax(0.02f, std::fmin(front_fade, 1.0f));
     }
@@ -1398,30 +1419,49 @@ private:
         const float outer_radius = radius * 1.16f;
         const float inner_radius = radius * 0.72f;
         const float hot_radius = radius * 0.38f;
-        const DWORD outer_center_color = scale_alpha(outer_color, directional_head_fade(0.0f, 0.0f, direction_x, direction_y, landing_t));
-        const DWORD inner_center_color = scale_alpha(inner_color, directional_head_fade(0.0f, 0.0f, direction_x, direction_y, landing_t));
-        const DWORD hot_center_color = scale_alpha(hot_color, directional_head_fade(0.0f, 0.0f, direction_x, direction_y, landing_t));
+        const float target_absorb = landing_t * landing_t * (3.0f - 2.0f * landing_t);
+        const float center_fade = directional_head_fade(0.0f, 0.0f, direction_x, direction_y, target_absorb);
+        const DWORD outer_center_color = scale_alpha(outer_color, center_fade);
+        const DWORD inner_center_color = scale_alpha(inner_color, center_fade);
+        const DWORD hot_center_color = scale_alpha(hot_color, center_fade);
+        float outer_x[head_marker_slices_ + 1] {};
+        float outer_y[head_marker_slices_ + 1] {};
+        float inner_x[head_marker_slices_ + 1] {};
+        float inner_y[head_marker_slices_ + 1] {};
+        float hot_x[head_marker_slices_ + 1] {};
+        float hot_y[head_marker_slices_ + 1] {};
+        DWORD outer_edge_color[head_marker_slices_ + 1] {};
+        DWORD inner_edge_color[head_marker_slices_ + 1] {};
+        DWORD hot_edge_color[head_marker_slices_ + 1] {};
         (void)haze_color_base;
 
-        for (int i = 0; i < head_marker_slices_; ++i) {
-            const float x0 = head_unit_x_[i];
-            const float y0 = head_unit_y_[i];
-            const float x1 = head_unit_x_[i + 1];
-            const float y1 = head_unit_y_[i + 1];
-            const float fade0 = directional_head_fade(x0, y0, direction_x, direction_y, landing_t);
-            const float fade1 = directional_head_fade(x1, y1, direction_x, direction_y, landing_t);
+        for (int i = 0; i <= head_marker_slices_; ++i) {
+            const float unit_x = head_unit_x_[i];
+            const float unit_y = head_unit_y_[i];
+            const float fade = directional_head_fade(unit_x, unit_y, direction_x, direction_y, target_absorb);
+            outer_x[i] = center_x + unit_x * outer_radius;
+            outer_y[i] = center_y + unit_y * outer_radius;
+            inner_x[i] = center_x + unit_x * inner_radius;
+            inner_y[i] = center_y + unit_y * inner_radius;
+            hot_x[i] = center_x + unit_x * hot_radius;
+            hot_y[i] = center_y + unit_y * hot_radius;
+            outer_edge_color[i] = scale_alpha(outer_color, 0.76f * fade);
+            inner_edge_color[i] = scale_alpha(inner_color, fade);
+            hot_edge_color[i] = scale_alpha(hot_color, fade);
+        }
 
+        for (int i = 0; i < head_marker_slices_; ++i) {
             vertices[vertex_count++] = DrawVertex {center_x, center_y, 0.0f, 1.0f, outer_center_color};
-            vertices[vertex_count++] = DrawVertex {center_x + x0 * outer_radius, center_y + y0 * outer_radius, 0.0f, 1.0f, scale_alpha(outer_color, 0.76f * fade0)};
-            vertices[vertex_count++] = DrawVertex {center_x + x1 * outer_radius, center_y + y1 * outer_radius, 0.0f, 1.0f, scale_alpha(outer_color, 0.76f * fade1)};
+            vertices[vertex_count++] = DrawVertex {outer_x[i], outer_y[i], 0.0f, 1.0f, outer_edge_color[i]};
+            vertices[vertex_count++] = DrawVertex {outer_x[i + 1], outer_y[i + 1], 0.0f, 1.0f, outer_edge_color[i + 1]};
 
             vertices[vertex_count++] = DrawVertex {center_x, center_y, 0.0f, 1.0f, inner_center_color};
-            vertices[vertex_count++] = DrawVertex {center_x + x0 * inner_radius, center_y + y0 * inner_radius, 0.0f, 1.0f, scale_alpha(inner_color, fade0)};
-            vertices[vertex_count++] = DrawVertex {center_x + x1 * inner_radius, center_y + y1 * inner_radius, 0.0f, 1.0f, scale_alpha(inner_color, fade1)};
+            vertices[vertex_count++] = DrawVertex {inner_x[i], inner_y[i], 0.0f, 1.0f, inner_edge_color[i]};
+            vertices[vertex_count++] = DrawVertex {inner_x[i + 1], inner_y[i + 1], 0.0f, 1.0f, inner_edge_color[i + 1]};
 
             vertices[vertex_count++] = DrawVertex {center_x, center_y, 0.0f, 1.0f, hot_center_color};
-            vertices[vertex_count++] = DrawVertex {center_x + x0 * hot_radius, center_y + y0 * hot_radius, 0.0f, 1.0f, scale_alpha(hot_color, fade0)};
-            vertices[vertex_count++] = DrawVertex {center_x + x1 * hot_radius, center_y + y1 * hot_radius, 0.0f, 1.0f, scale_alpha(hot_color, fade1)};
+            vertices[vertex_count++] = DrawVertex {hot_x[i], hot_y[i], 0.0f, 1.0f, hot_edge_color[i]};
+            vertices[vertex_count++] = DrawVertex {hot_x[i + 1], hot_y[i + 1], 0.0f, 1.0f, hot_edge_color[i + 1]};
         }
 
         draw_vertices(D3DPT_TRIANGLELIST, vertex_count / 3, vertices, sizeof(DrawVertex));
@@ -2341,29 +2381,10 @@ private:
         return true;
     }
 
-    void append_segment_quad(DrawVertex* vertices, int& vertex_count, float x1, float y1, float x2, float y2, float thickness, DWORD color, float trim_end) {
-        const float dx = x2 - x1;
-        const float dy = y2 - y1;
-        const float length = std::sqrt(dx * dx + dy * dy);
-        if (length <= 0.01f) {
-            return;
-        }
-
-        if (trim_end > 0.0f) {
-            const float visible_length = std::fmax(0.01f, length - trim_end);
-            x2 = x1 + (dx / length) * visible_length;
-            y2 = y1 + (dy / length) * visible_length;
-        }
-
-        const float clipped_dx = x2 - x1;
-        const float clipped_dy = y2 - y1;
-        const float clipped_length = std::sqrt(clipped_dx * clipped_dx + clipped_dy * clipped_dy);
-        if (clipped_length <= 0.01f) {
-            return;
-        }
-
-        const float nx = -clipped_dy / clipped_length * thickness * 0.5f;
-        const float ny = clipped_dx / clipped_length * thickness * 0.5f;
+    void append_segment_quad_with_normal(DrawVertex* vertices, int& vertex_count, float x1, float y1,
+        float x2, float y2, float normal_x, float normal_y, float thickness, DWORD color) {
+        const float nx = normal_x * thickness * 0.5f;
+        const float ny = normal_y * thickness * 0.5f;
 
         const DrawVertex a {x1 + nx, y1 + ny, 0.0f, 1.0f, color};
         const DrawVertex b {x1 - nx, y1 - ny, 0.0f, 1.0f, color};
@@ -2378,9 +2399,12 @@ private:
         vertices[vertex_count++] = d;
     }
 
-    void append_segment_quad_clipped_to_circle(DrawVertex* vertices, int& vertex_count, float x1, float y1, float x2, float y2, float thickness, DWORD color, float circle_x, float circle_y, float radius) {
+    void append_segment_quad_clipped_to_circle(DrawVertex* vertices, int& vertex_count, float x1, float y1,
+        float x2, float y2, float segment_dx, float segment_dy, float segment_length, float segment_length_sq,
+        float normal_x, float normal_y, float thickness, DWORD color, float circle_x, float circle_y, float radius) {
         if (radius <= 0.0f) {
-            append_segment_quad(vertices, vertex_count, x1, y1, x2, y2, thickness, color, 0.0f);
+            append_segment_quad_with_normal(vertices, vertex_count, x1, y1, x2, y2,
+                normal_x, normal_y, thickness, color);
             return;
         }
 
@@ -2397,14 +2421,13 @@ private:
         }
 
         if (start_distance_sq > radius_sq && end_distance_sq > radius_sq) {
-            append_segment_quad(vertices, vertex_count, x1, y1, x2, y2, thickness, color, 0.0f);
+            append_segment_quad_with_normal(vertices, vertex_count, x1, y1, x2, y2,
+                normal_x, normal_y, thickness, color);
             return;
         }
 
-        const float dx = x2 - x1;
-        const float dy = y2 - y1;
-        const float a = dx * dx + dy * dy;
-        const float b = 2.0f * (sx * dx + sy * dy);
+        const float a = segment_length_sq;
+        const float b = 2.0f * (sx * segment_dx + sy * segment_dy);
         const float c = start_distance_sq - radius_sq;
         const float discriminant = b * b - 4.0f * a * c;
         if (a <= 0.0001f || discriminant < 0.0f) {
@@ -2425,12 +2448,18 @@ private:
             return;
         }
 
-        const float ix = x1 + dx * t;
-        const float iy = y1 + dy * t;
+        const float ix = x1 + segment_dx * t;
+        const float iy = y1 + segment_dy * t;
         if (start_distance_sq > radius_sq) {
-            append_segment_quad(vertices, vertex_count, x1, y1, ix, iy, thickness, color, 0.0f);
+            if (segment_length * t > 0.01f) {
+                append_segment_quad_with_normal(vertices, vertex_count, x1, y1, ix, iy,
+                    normal_x, normal_y, thickness, color);
+            }
         } else {
-            append_segment_quad(vertices, vertex_count, ix, iy, x2, y2, thickness, color, 0.0f);
+            if (segment_length * (1.0f - t) > 0.01f) {
+                append_segment_quad_with_normal(vertices, vertex_count, ix, iy, x2, y2,
+                    normal_x, normal_y, thickness, color);
+            }
         }
     }
 
