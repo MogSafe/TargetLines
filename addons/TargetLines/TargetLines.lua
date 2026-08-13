@@ -106,6 +106,7 @@ local last_state_maintenance = 0
 local state_maintenance_interval = 0.25
 local next_line_expiration = 0
 local last_benchmark_input_signature = nil
+local benchmark_reference_source = nil
 local last_boneprobe_active = false
 local last_benchmark_stats_read = 0
 local benchmark_stats = nil
@@ -1751,10 +1752,14 @@ windower.register_event('prerender', function()
     local benchmark_generation = nil
     local benchmark_input_signature = nil
     if benchmark_count >= 0 then
-        benchmark_source = player_point(windower.ffxi.get_player())
         benchmark_generation = math.floor(now / 5) % 100000
-        benchmark_input_signature = ('%u:%u:%s'):format(
-            benchmark_count, benchmark_generation, point_json(benchmark_source))
+        benchmark_input_signature = ('%u:%u'):format(benchmark_count, benchmark_generation)
+        if benchmark_input_signature ~= last_benchmark_input_signature or not benchmark_reference_source then
+            benchmark_reference_source = player_point(windower.ffxi.get_player())
+        end
+        benchmark_source = benchmark_reference_source
+    else
+        benchmark_reference_source = nil
     end
 
     local boneprobe_active = now < boneprobe_until

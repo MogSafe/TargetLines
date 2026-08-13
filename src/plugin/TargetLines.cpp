@@ -833,7 +833,9 @@ private:
     struct AnchorCacheEntry {
         DWORD index = 0;
         int bone = -1;
+        bool is_npc = false;
         bool resolved = false;
+        bool uses_height_offset = true;
         float x = 0.0f;
         float y = 0.0f;
         float z = 0.0f;
@@ -867,9 +869,7 @@ private:
         }
 
         std::uintptr_t mob_array = 0;
-        if (dynamic_bone_ >= 0) {
-            get_luacore_mob_array(mob_array, nullptr, nullptr);
-        }
+        get_luacore_mob_array(mob_array, nullptr, nullptr);
         anchor_cache_count_ = 0;
 
         const DWORD now_ms = GetTickCount();
@@ -968,15 +968,26 @@ private:
         const DWORD core_color = scale_alpha(tint_white_color(saturated_color, 0.50f), 1.25f);
         const DWORD shine_color = scale_alpha(tint_white_color(saturated_color, 0.94f), 1.18f);
 
-        float p0_x = line.source_x;
-        float p0_y = line.source_y;
-        float p0_z = line.source_z + model_adjusted_height(source_height_offset_, line.source_model_size, line.source_model_scale, line.source_short_anchor, line.source_floating_anchor, line.source_is_npc);
+        const float source_height = model_adjusted_height(source_height_offset_, line.source_model_size, line.source_model_scale, line.source_short_anchor, line.source_floating_anchor, line.source_is_npc);
+        const float target_height = model_adjusted_height(target_height_offset_, line.target_model_size, line.target_model_scale, line.target_short_anchor, line.target_floating_anchor, line.target_is_npc);
+        const float serialized_source_x = line.source_x;
+        const float serialized_source_y = line.source_y;
+        const float serialized_source_z = line.source_z + source_height;
+        float p0_x = serialized_source_x;
+        float p0_y = serialized_source_y;
+        float p0_z = serialized_source_z;
         float p2_x = line.target_x;
         float p2_y = line.target_y;
-        float p2_z = line.target_z + model_adjusted_height(target_height_offset_, line.target_model_size, line.target_model_scale, line.target_short_anchor, line.target_floating_anchor, line.target_is_npc);
-        if (dynamic_bone_ >= 0) {
-            resolve_dynamic_anchor_cached(mob_array, line.source_is_npc, line.source_index, dynamic_bone_, p0_x, p0_y, p0_z);
-            resolve_dynamic_anchor_cached(mob_array, line.target_is_npc, line.target_index, dynamic_bone_, p2_x, p2_y, p2_z);
+        float p2_z = line.target_z + target_height;
+        const bool source_resolved = resolve_live_anchor_cached(mob_array, line.source_is_npc, line.source_index,
+            dynamic_bone_, source_height, p0_x, p0_y, p0_z);
+        if (benchmark_enabled_ && source_resolved) {
+            p2_x += p0_x - serialized_source_x;
+            p2_y += p0_y - serialized_source_y;
+            p2_z += p0_z - serialized_source_z;
+        } else {
+            resolve_live_anchor_cached(mob_array, line.target_is_npc, line.target_index,
+                dynamic_bone_, target_height, p2_x, p2_y, p2_z);
         }
         if (spread_source) {
             apply_source_spread(line, p0_x, p0_y);
@@ -1255,20 +1266,14 @@ private:
         return manual_offset - auto_raise;
     }
 
-    bool resolve_dynamic_anchor(std::uintptr_t mob_array, bool is_npc, DWORD index, int bone, float& lua_x, float& lua_y, float& lua_z) {
-        if (mob_array == 0 || !is_npc || index == 0 || index >= 0x900) {
+    bool resolve_live_anchor(std::uintptr_t mob_array, bool is_npc, DWORD index, int bone,
+        float& lua_x, float& lua_y, float& lua_z, bool& uses_height_offset) {
+        if (mob_array == 0 || index == 0 || index >= 0x900) {
             return false;
         }
 
         std::uintptr_t mob = 0;
         if (!read_memory(mob_array + static_cast<std::uintptr_t>(index) * sizeof(std::uintptr_t), mob) || !is_readable_range(mob, 0x0a4)) {
-            return false;
-        }
-
-        float mob_x = 0.0f;
-        float mob_y = 0.0f;
-        float mob_z = 0.0f;
-        if (!read_luacore_mob_root(mob, mob_x, mob_y, mob_z)) {
             return false;
         }
 
@@ -1284,24 +1289,24 @@ private:
             return false;
         }
 
-        const float dx = actor_x - mob_x;
-        const float dy = actor_y - mob_y;
-        const float dz = actor_z - mob_z;
-        if (std::sqrt(dx * dx + dy * dy + dz * dz) > 0.50f) {
-            return false;
+        if (is_npc && bone >= 0) {
+            float bone_x = 0.0f;
+            float bone_y = 0.0f;
+            float bone_z = 0.0f;
+            char detail[128] {};
+            if (read_bone_anchor(actor, bone, bone_x, bone_y, bone_z, detail, sizeof(detail))) {
+                lua_x = bone_x;
+                lua_y = bone_y;
+                lua_z = bone_z;
+                uses_height_offset = false;
+                return true;
+            }
         }
 
-        float bone_x = 0.0f;
-        float bone_y = 0.0f;
-        float bone_z = 0.0f;
-        char detail[128] {};
-        if (!read_bone_anchor(actor, bone, bone_x, bone_y, bone_z, detail, sizeof(detail))) {
-            return false;
-        }
-
-        lua_x = bone_x;
-        lua_y = bone_y;
-        lua_z = bone_z;
+        lua_x = actor_x;
+        lua_y = actor_y;
+        lua_z = actor_z;
+        uses_height_offset = true;
         return true;
     }
 
@@ -2330,36 +2335,39 @@ private:
         return true;
     }
 
-    bool resolve_dynamic_anchor_cached(std::uintptr_t mob_array, bool is_npc, DWORD index, int bone,
-        float& lua_x, float& lua_y, float& lua_z) {
-        if (mob_array == 0 || !is_npc || index == 0 || index >= 0x900) {
+    bool resolve_live_anchor_cached(std::uintptr_t mob_array, bool is_npc, DWORD index, int bone,
+        float height_offset, float& lua_x, float& lua_y, float& lua_z) {
+        if (mob_array == 0 || index == 0 || index >= 0x900) {
             return false;
         }
 
         for (int i = 0; i < anchor_cache_count_; ++i) {
             const AnchorCacheEntry& entry = anchor_cache_[i];
-            if (entry.index != index || entry.bone != bone) {
+            if (entry.index != index || entry.bone != bone || entry.is_npc != is_npc) {
                 continue;
             }
 
             if (entry.resolved) {
                 lua_x = entry.x;
                 lua_y = entry.y;
-                lua_z = entry.z;
+                lua_z = entry.z + (entry.uses_height_offset ? height_offset : 0.0f);
             }
             return entry.resolved;
         }
 
         float resolved_x = lua_x;
         float resolved_y = lua_y;
-        float resolved_z = lua_z;
-        const bool resolved = resolve_dynamic_anchor(mob_array, is_npc, index, bone,
-            resolved_x, resolved_y, resolved_z);
+        float resolved_z = lua_z - height_offset;
+        bool uses_height_offset = true;
+        const bool resolved = resolve_live_anchor(mob_array, is_npc, index, bone,
+            resolved_x, resolved_y, resolved_z, uses_height_offset);
         if (anchor_cache_count_ < max_anchor_cache_entries_) {
             AnchorCacheEntry& entry = anchor_cache_[anchor_cache_count_++];
             entry.index = index;
             entry.bone = bone;
+            entry.is_npc = is_npc;
             entry.resolved = resolved;
+            entry.uses_height_offset = uses_height_offset;
             entry.x = resolved_x;
             entry.y = resolved_y;
             entry.z = resolved_z;
@@ -2368,7 +2376,7 @@ private:
         if (resolved) {
             lua_x = resolved_x;
             lua_y = resolved_y;
-            lua_z = resolved_z;
+            lua_z = resolved_z + (uses_height_offset ? height_offset : 0.0f);
         }
         return resolved;
     }
