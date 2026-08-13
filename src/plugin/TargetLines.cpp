@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <d3d8.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cmath>
 #include <ctime>
@@ -79,6 +80,8 @@ public:
 
     void __stdcall Load(PluginManager* manager) override {
         plugin_manager_ = manager;
+        QueryPerformanceFrequency(&performance_frequency_);
+        initialize_geometry_tables();
         append_module_log("Load called");
         initialize_paths_from_module();
         append_log("loaded");
@@ -87,6 +90,7 @@ public:
 
     void __stdcall Unload() override {
         append_log("unloaded");
+        close_state_change_notification();
     }
 
     void __stdcall PluginCommand(const char* command) override {
@@ -120,7 +124,7 @@ public:
 
         if (std::strcmp(command, "renderstats") == 0) {
             char message[512] {};
-            std::snprintf(message, sizeof(message), "postrender_calls=%lu last_line_count=%d", postrender_calls_, last_line_count_);
+            std::snprintf(message, sizeof(message), "postrender_calls=%lu cached_line_count=%d", postrender_calls_, cached_line_count_);
             append_log(message);
             return;
         }
@@ -270,21 +274,33 @@ public:
     }
 
     void __stdcall PostRender() override {
-        ++postrender_calls_;
+        LARGE_INTEGER frame_counter {};
+        QueryPerformanceCounter(&frame_counter);
+        const float frame_ms = previous_postrender_counter_ > 0
+            ? counter_milliseconds(frame_counter.QuadPart - previous_postrender_counter_)
+            : 0.0f;
+        previous_postrender_counter_ = frame_counter.QuadPart;
+        benchmark_current_projections_ = 0;
+        benchmark_current_draw_calls_ = 0;
+        benchmark_current_state_reads_ = 0;
+        projection_matrices_valid_ = false;
 
-        if (postrender_calls_ == 1 || (postrender_calls_ % 300) == 0) {
-            last_line_count_ = count_lines();
-            char message[512] {};
-            std::snprintf(message, sizeof(message), "postrender heartbeat calls=%lu lines=%d", postrender_calls_, last_line_count_);
-            append_log(message);
-        }
+        ++postrender_calls_;
 
         if (debug_bar_enabled_) {
             draw_test_bar();
         }
 
         if (overlay_enabled_) {
+            LARGE_INTEGER overlay_start {};
+            LARGE_INTEGER overlay_end {};
+            QueryPerformanceCounter(&overlay_start);
             draw_lines();
+            QueryPerformanceCounter(&overlay_end);
+            if (benchmark_enabled_) {
+                record_benchmark_sample(frame_ms,
+                    counter_milliseconds(overlay_end.QuadPart - overlay_start.QuadPart));
+            }
         }
 
         if (matrix_probe_pending_) {
@@ -751,6 +767,24 @@ private:
         DWORD color;
     };
 
+    static constexpr int head_marker_slices_ = 36;
+    static constexpr int round_cap_slices_ = 24;
+
+    void initialize_geometry_tables() {
+        for (int i = 0; i <= head_marker_slices_; ++i) {
+            const float angle = 6.28318530718f * static_cast<float>(i) / static_cast<float>(head_marker_slices_);
+            head_unit_x_[i] = std::cos(angle);
+            head_unit_y_[i] = std::sin(angle);
+        }
+
+        for (int i = 0; i <= round_cap_slices_; ++i) {
+            const float angle = -1.57079632679f
+                + 3.14159265359f * static_cast<float>(i) / static_cast<float>(round_cap_slices_);
+            cap_unit_x_[i] = std::cos(angle);
+            cap_unit_y_[i] = std::sin(angle);
+        }
+    }
+
     void draw_test_bar() {
         DrawVertex vertices[] = {
             {80.0f, 80.0f, 0.0f, 1.0f, 0xCCFF3030},
@@ -796,9 +830,18 @@ private:
         bool spread_target = false;
     };
 
+    struct AnchorCacheEntry {
+        DWORD index = 0;
+        int bone = -1;
+        bool resolved = false;
+        float x = 0.0f;
+        float y = 0.0f;
+        float z = 0.0f;
+    };
+
     void draw_lines() {
-        LineState lines[16] {};
-        const int line_count = read_lines(lines, 16);
+        LineState lines[128] {};
+        const int line_count = read_lines(lines, 128);
         if (line_count <= 0) {
             return;
         }
@@ -815,7 +858,10 @@ private:
         }
 
         D3DVIEWPORT8 viewport {};
-        if (!d3d_device_ || FAILED(d3d_device_->GetViewport(&viewport))) {
+        if (!refresh_projection_matrices()) {
+            return;
+        }
+        if (FAILED(d3d_device_->GetViewport(&viewport))) {
             viewport.Width = 1024;
             viewport.Height = 768;
         }
@@ -824,8 +870,18 @@ private:
         if (dynamic_bone_ >= 0) {
             get_luacore_mob_array(mob_array, nullptr, nullptr);
         }
+        anchor_cache_count_ = 0;
 
         const DWORD now_ms = GetTickCount();
+        bool spread_sources[128] {};
+        bool spread_targets[128] {};
+        prepare_new_line_relationships(lines, line_count, spread_sources, spread_targets);
+
+        if (!begin_draw_state()) {
+            return;
+        }
+
+        begin_line_batch();
         for (int i = 0; i < line_count; ++i) {
             ActiveLine* active = nullptr;
             float progress = 1.0f;
@@ -833,7 +889,7 @@ private:
             float settle = 0.0f;
             float tail = 0.0f;
             DWORD color = lines[i].color;
-            if (!prepare_animated_line(lines[i], lines, line_count, i, now_ms, active, progress, arc_settle, settle, tail, color)) {
+            if (!prepare_animated_line(lines[i], now_ms, spread_sources[i], spread_targets[i], active, progress, arc_settle, settle, tail, color)) {
                 continue;
             }
 
@@ -842,17 +898,19 @@ private:
             draw_line_curve(lines[i], viewport, mob_array, spread_source, spread_target, progress, arc_settle, settle, tail, color);
         }
 
+        end_line_batch();
+        end_draw_state();
         prune_active_lines(now_ms);
     }
 
-    bool prepare_animated_line(const LineState& line, const LineState* lines, int line_count, int index, DWORD now_ms, ActiveLine*& active, float& progress, float& arc_settle, float& settle, float& tail, DWORD& color) {
+    bool prepare_animated_line(const LineState& line, DWORD now_ms, bool spread_source, bool spread_target, ActiveLine*& active, float& progress, float& arc_settle, float& settle, float& tail, DWORD& color) {
         const unsigned long long key = line_key(line);
         active = find_active_line(key);
         if (!active) {
             active = allocate_active_line(key, now_ms);
             if (active) {
-                active->spread_source = source_continues_from_existing_target(lines, line_count, index);
-                active->spread_target = shared_target_line(lines, line_count, index);
+                active->spread_source = spread_source;
+                active->spread_target = spread_target;
             }
         }
 
@@ -917,8 +975,8 @@ private:
         float p2_y = line.target_y;
         float p2_z = line.target_z + model_adjusted_height(target_height_offset_, line.target_model_size, line.target_model_scale, line.target_short_anchor, line.target_floating_anchor, line.target_is_npc);
         if (dynamic_bone_ >= 0) {
-            resolve_dynamic_anchor(mob_array, line.source_is_npc, line.source_index, dynamic_bone_, p0_x, p0_y, p0_z);
-            resolve_dynamic_anchor(mob_array, line.target_is_npc, line.target_index, dynamic_bone_, p2_x, p2_y, p2_z);
+            resolve_dynamic_anchor_cached(mob_array, line.source_is_npc, line.source_index, dynamic_bone_, p0_x, p0_y, p0_z);
+            resolve_dynamic_anchor_cached(mob_array, line.target_is_npc, line.target_index, dynamic_bone_, p2_x, p2_y, p2_z);
         }
         if (spread_source) {
             apply_source_spread(line, p0_x, p0_y);
@@ -999,10 +1057,32 @@ private:
             }
 
             const float segment_alpha = segment_alphas[i];
-            append_segment_quad(haze_vertices, haze_vertex_count, screen_xs[i - 1], screen_ys[i - 1], screen_xs[i], screen_ys[i], haze_thickness, scale_alpha(haze_color, segment_alpha), 0.0f);
-            append_segment_quad_clipped_to_circle(border_vertices, border_vertex_count, screen_xs[i - 1], screen_ys[i - 1], screen_xs[i], screen_ys[i], border_thickness, scale_alpha(border_color, segment_alpha), head_x, head_y, head_outer_radius * 0.72f);
-            append_segment_quad_clipped_to_circle(core_vertices, core_vertex_count, screen_xs[i - 1], screen_ys[i - 1], screen_xs[i], screen_ys[i], core_thickness, scale_alpha(core_color, segment_alpha), head_x, head_y, head_inner_radius * 0.82f);
-            append_segment_quad_clipped_to_circle(shine_vertices, shine_vertex_count, screen_xs[i - 1], screen_ys[i - 1], screen_xs[i], screen_ys[i], std::fmax(2.5f, core_thickness * 0.42f), scale_alpha(shine_color, segment_alpha), head_x, head_y, head_hot_radius * 0.92f);
+            const float x1 = screen_xs[i - 1];
+            const float y1 = screen_ys[i - 1];
+            const float x2 = screen_xs[i];
+            const float y2 = screen_ys[i];
+            const float segment_dx = x2 - x1;
+            const float segment_dy = y2 - y1;
+            const float segment_length_sq = segment_dx * segment_dx + segment_dy * segment_dy;
+            if (segment_length_sq <= 0.0001f) {
+                continue;
+            }
+            const float segment_length = std::sqrt(segment_length_sq);
+            const float normal_x = -segment_dy / segment_length;
+            const float normal_y = segment_dx / segment_length;
+
+            append_segment_quad_with_normal(haze_vertices, haze_vertex_count, x1, y1, x2, y2,
+                normal_x, normal_y, haze_thickness, scale_alpha(haze_color, segment_alpha));
+            append_segment_quad_clipped_to_circle(border_vertices, border_vertex_count, x1, y1, x2, y2,
+                segment_dx, segment_dy, segment_length, segment_length_sq, normal_x, normal_y,
+                border_thickness, scale_alpha(border_color, segment_alpha), head_x, head_y, head_outer_radius * 0.72f);
+            append_segment_quad_clipped_to_circle(core_vertices, core_vertex_count, x1, y1, x2, y2,
+                segment_dx, segment_dy, segment_length, segment_length_sq, normal_x, normal_y,
+                core_thickness, scale_alpha(core_color, segment_alpha), head_x, head_y, head_inner_radius * 0.82f);
+            append_segment_quad_clipped_to_circle(shine_vertices, shine_vertex_count, x1, y1, x2, y2,
+                segment_dx, segment_dy, segment_length, segment_length_sq, normal_x, normal_y,
+                std::fmax(2.5f, core_thickness * 0.42f), scale_alpha(shine_color, segment_alpha),
+                head_x, head_y, head_hot_radius * 0.92f);
         }
 
         if (haze_vertex_count > 0) {
@@ -1079,32 +1159,32 @@ private:
         return index < other_index;
     }
 
-    bool source_continues_from_existing_target(const LineState* lines, int line_count, int index) const {
-        if (!lines || index < 0 || index >= line_count) {
-            return false;
+    void prepare_new_line_relationships(const LineState* lines, int line_count, bool* spread_sources, bool* spread_targets) {
+        if (!lines || !spread_sources || !spread_targets || line_count <= 0) {
+            return;
         }
 
-        for (int i = 0; i < line_count; ++i) {
-            if (i != index && line_is_newer_than(lines[index], lines[i], index, i) && source_matches_target(lines[index], lines[i])) {
-                return true;
+        for (int index = 0; index < line_count; ++index) {
+            if (find_active_line(line_key(lines[index]))) {
+                continue;
+            }
+
+            for (int other_index = 0; other_index < line_count; ++other_index) {
+                if (other_index == index || !line_is_newer_than(lines[index], lines[other_index], index, other_index)) {
+                    continue;
+                }
+
+                if (!spread_sources[index] && source_matches_target(lines[index], lines[other_index])) {
+                    spread_sources[index] = true;
+                }
+                if (!spread_targets[index] && same_target(lines[index], lines[other_index])) {
+                    spread_targets[index] = true;
+                }
+                if (spread_sources[index] && spread_targets[index]) {
+                    break;
+                }
             }
         }
-
-        return false;
-    }
-
-    bool shared_target_line(const LineState* lines, int line_count, int index) const {
-        if (!lines || index < 0 || index >= line_count) {
-            return false;
-        }
-
-        for (int i = 0; i < line_count; ++i) {
-            if (i != index && line_is_newer_than(lines[index], lines[i], index, i) && same_target(lines[index], lines[i])) {
-                return true;
-            }
-        }
-
-        return false;
     }
 
     std::uint32_t mix_u32(std::uint32_t value) const {
@@ -1328,22 +1408,15 @@ private:
         return alpha | (red << 16) | (green << 8) | blue;
     }
 
-    float directional_head_fade(float unit_x, float unit_y, float direction_x, float direction_y, float landing_t) const {
-        const float direction_length = std::sqrt(direction_x * direction_x + direction_y * direction_y);
-        if (direction_length <= 0.001f) {
-            return 1.0f - landing_t * 0.72f;
-        }
-
-        const float dot = (unit_x * direction_x + unit_y * direction_y) / direction_length;
+    float directional_head_fade(float unit_x, float unit_y, float direction_x, float direction_y, float target_absorb) const {
+        const float dot = unit_x * direction_x + unit_y * direction_y;
         const float target_side = std::fmax(0.0f, std::fmin((dot + 1.0f) * 0.5f, 1.0f));
-        const float target_absorb = landing_t * landing_t * (3.0f - 2.0f * landing_t);
         const float front_fade = 1.0f - target_absorb * (0.30f + target_side * 0.68f);
         return std::fmax(0.02f, std::fmin(front_fade, 1.0f));
     }
 
     void draw_head_marker(float center_x, float center_y, float radius, DWORD haze_color_base, DWORD core_color, DWORD shine_color, float direction_x, float direction_y, float landing_t, float base_alpha) {
-        constexpr int slices = 36;
-        DrawVertex vertices[slices * 9] {};
+        DrawVertex vertices[head_marker_slices_ * 9] {};
         int vertex_count = 0;
         const DWORD outer_color = scale_alpha(core_color, 0.86f * base_alpha);
         const DWORD inner_color = scale_alpha(core_color, 1.16f * base_alpha);
@@ -1351,56 +1424,73 @@ private:
         const float outer_radius = radius * 1.16f;
         const float inner_radius = radius * 0.72f;
         const float hot_radius = radius * 0.38f;
-        const DWORD outer_center_color = scale_alpha(outer_color, directional_head_fade(0.0f, 0.0f, direction_x, direction_y, landing_t));
-        const DWORD inner_center_color = scale_alpha(inner_color, directional_head_fade(0.0f, 0.0f, direction_x, direction_y, landing_t));
-        const DWORD hot_center_color = scale_alpha(hot_color, directional_head_fade(0.0f, 0.0f, direction_x, direction_y, landing_t));
+        const float target_absorb = landing_t * landing_t * (3.0f - 2.0f * landing_t);
+        const float center_fade = directional_head_fade(0.0f, 0.0f, direction_x, direction_y, target_absorb);
+        const DWORD outer_center_color = scale_alpha(outer_color, center_fade);
+        const DWORD inner_center_color = scale_alpha(inner_color, center_fade);
+        const DWORD hot_center_color = scale_alpha(hot_color, center_fade);
+        float outer_x[head_marker_slices_ + 1] {};
+        float outer_y[head_marker_slices_ + 1] {};
+        float inner_x[head_marker_slices_ + 1] {};
+        float inner_y[head_marker_slices_ + 1] {};
+        float hot_x[head_marker_slices_ + 1] {};
+        float hot_y[head_marker_slices_ + 1] {};
+        DWORD outer_edge_color[head_marker_slices_ + 1] {};
+        DWORD inner_edge_color[head_marker_slices_ + 1] {};
+        DWORD hot_edge_color[head_marker_slices_ + 1] {};
         (void)haze_color_base;
 
-        for (int i = 0; i < slices; ++i) {
-            const float a0 = 6.28318530718f * static_cast<float>(i) / static_cast<float>(slices);
-            const float a1 = 6.28318530718f * static_cast<float>(i + 1) / static_cast<float>(slices);
-            const float x0 = std::cos(a0);
-            const float y0 = std::sin(a0);
-            const float x1 = std::cos(a1);
-            const float y1 = std::sin(a1);
-            const float fade0 = directional_head_fade(x0, y0, direction_x, direction_y, landing_t);
-            const float fade1 = directional_head_fade(x1, y1, direction_x, direction_y, landing_t);
+        for (int i = 0; i <= head_marker_slices_; ++i) {
+            const float unit_x = head_unit_x_[i];
+            const float unit_y = head_unit_y_[i];
+            const float fade = directional_head_fade(unit_x, unit_y, direction_x, direction_y, target_absorb);
+            outer_x[i] = center_x + unit_x * outer_radius;
+            outer_y[i] = center_y + unit_y * outer_radius;
+            inner_x[i] = center_x + unit_x * inner_radius;
+            inner_y[i] = center_y + unit_y * inner_radius;
+            hot_x[i] = center_x + unit_x * hot_radius;
+            hot_y[i] = center_y + unit_y * hot_radius;
+            outer_edge_color[i] = scale_alpha(outer_color, 0.76f * fade);
+            inner_edge_color[i] = scale_alpha(inner_color, fade);
+            hot_edge_color[i] = scale_alpha(hot_color, fade);
+        }
 
+        for (int i = 0; i < head_marker_slices_; ++i) {
             vertices[vertex_count++] = DrawVertex {center_x, center_y, 0.0f, 1.0f, outer_center_color};
-            vertices[vertex_count++] = DrawVertex {center_x + x0 * outer_radius, center_y + y0 * outer_radius, 0.0f, 1.0f, scale_alpha(outer_color, 0.76f * fade0)};
-            vertices[vertex_count++] = DrawVertex {center_x + x1 * outer_radius, center_y + y1 * outer_radius, 0.0f, 1.0f, scale_alpha(outer_color, 0.76f * fade1)};
+            vertices[vertex_count++] = DrawVertex {outer_x[i], outer_y[i], 0.0f, 1.0f, outer_edge_color[i]};
+            vertices[vertex_count++] = DrawVertex {outer_x[i + 1], outer_y[i + 1], 0.0f, 1.0f, outer_edge_color[i + 1]};
 
             vertices[vertex_count++] = DrawVertex {center_x, center_y, 0.0f, 1.0f, inner_center_color};
-            vertices[vertex_count++] = DrawVertex {center_x + x0 * inner_radius, center_y + y0 * inner_radius, 0.0f, 1.0f, scale_alpha(inner_color, fade0)};
-            vertices[vertex_count++] = DrawVertex {center_x + x1 * inner_radius, center_y + y1 * inner_radius, 0.0f, 1.0f, scale_alpha(inner_color, fade1)};
+            vertices[vertex_count++] = DrawVertex {inner_x[i], inner_y[i], 0.0f, 1.0f, inner_edge_color[i]};
+            vertices[vertex_count++] = DrawVertex {inner_x[i + 1], inner_y[i + 1], 0.0f, 1.0f, inner_edge_color[i + 1]};
 
             vertices[vertex_count++] = DrawVertex {center_x, center_y, 0.0f, 1.0f, hot_center_color};
-            vertices[vertex_count++] = DrawVertex {center_x + x0 * hot_radius, center_y + y0 * hot_radius, 0.0f, 1.0f, scale_alpha(hot_color, fade0)};
-            vertices[vertex_count++] = DrawVertex {center_x + x1 * hot_radius, center_y + y1 * hot_radius, 0.0f, 1.0f, scale_alpha(hot_color, fade1)};
+            vertices[vertex_count++] = DrawVertex {hot_x[i], hot_y[i], 0.0f, 1.0f, hot_edge_color[i]};
+            vertices[vertex_count++] = DrawVertex {hot_x[i + 1], hot_y[i + 1], 0.0f, 1.0f, hot_edge_color[i + 1]};
         }
 
         draw_vertices(D3DPT_TRIANGLELIST, vertex_count / 3, vertices, sizeof(DrawVertex));
     }
 
     void draw_round_line_cap(float center_x, float center_y, float direction_x, float direction_y, float radius, DWORD color) {
-        constexpr int slices = 24;
-        DrawVertex vertices[slices * 3] {};
+        DrawVertex vertices[round_cap_slices_ * 3] {};
         int vertex_count = 0;
         const float length = std::sqrt(direction_x * direction_x + direction_y * direction_y);
         if (radius <= 0.1f || length <= 0.001f) {
             return;
         }
 
-        const float angle = std::atan2(direction_y / length, direction_x / length);
-        const float start = angle - 1.57079632679f;
-        const float step = 3.14159265359f / static_cast<float>(slices);
+        const float unit_direction_x = direction_x / length;
+        const float unit_direction_y = direction_y / length;
 
-        for (int i = 0; i < slices; ++i) {
-            const float a0 = start + step * static_cast<float>(i);
-            const float a1 = start + step * static_cast<float>(i + 1);
+        for (int i = 0; i < round_cap_slices_; ++i) {
+            const float x0 = unit_direction_x * cap_unit_x_[i] - unit_direction_y * cap_unit_y_[i];
+            const float y0 = unit_direction_y * cap_unit_x_[i] + unit_direction_x * cap_unit_y_[i];
+            const float x1 = unit_direction_x * cap_unit_x_[i + 1] - unit_direction_y * cap_unit_y_[i + 1];
+            const float y1 = unit_direction_y * cap_unit_x_[i + 1] + unit_direction_x * cap_unit_y_[i + 1];
             vertices[vertex_count++] = DrawVertex {center_x, center_y, 0.0f, 1.0f, color};
-            vertices[vertex_count++] = DrawVertex {center_x + std::cos(a0) * radius, center_y + std::sin(a0) * radius, 0.0f, 1.0f, color};
-            vertices[vertex_count++] = DrawVertex {center_x + std::cos(a1) * radius, center_y + std::sin(a1) * radius, 0.0f, 1.0f, color};
+            vertices[vertex_count++] = DrawVertex {center_x + x0 * radius, center_y + y0 * radius, 0.0f, 1.0f, color};
+            vertices[vertex_count++] = DrawVertex {center_x + x1 * radius, center_y + y1 * radius, 0.0f, 1.0f, color};
         }
 
         draw_vertices(D3DPT_TRIANGLELIST, vertex_count / 3, vertices, sizeof(DrawVertex));
@@ -1849,22 +1939,172 @@ private:
         return {base, base + size};
     }
 
-    int read_lines(LineState* lines, int max_lines) {
-        FILE* file = std::fopen(state_path_, "rb");
-        if (!file) {
+    float counter_milliseconds(LONGLONG ticks) const {
+        if (performance_frequency_.QuadPart <= 0) {
+            return 0.0f;
+        }
+
+        return static_cast<float>(static_cast<double>(ticks) * 1000.0
+            / static_cast<double>(performance_frequency_.QuadPart));
+    }
+
+    void reset_benchmark_samples(DWORD now_ms) {
+        benchmark_sample_count_ = 0;
+        benchmark_projection_total_ = 0;
+        benchmark_draw_call_total_ = 0;
+        benchmark_state_read_total_ = 0;
+        benchmark_last_report_ms_ = now_ms;
+    }
+
+    void set_benchmark_state(bool enabled, int line_count) {
+        line_count = std::max(0, std::min(line_count, 128));
+        if (benchmark_enabled_ == enabled && benchmark_line_count_ == line_count) {
+            return;
+        }
+
+        benchmark_enabled_ = enabled;
+        benchmark_line_count_ = enabled ? line_count : 0;
+        benchmark_skip_next_sample_ = true;
+        reset_benchmark_samples(GetTickCount());
+    }
+
+    int benchmark_percentile_index(int count, float percentile) const {
+        if (count <= 1) {
             return 0;
         }
 
-        char buffer[32768] {};
+        const int index = static_cast<int>(std::ceil(percentile * static_cast<float>(count))) - 1;
+        return std::max(0, std::min(index, count - 1));
+    }
+
+    void write_benchmark_report() {
+        if (benchmark_path_[0] == '\0' || benchmark_sample_count_ <= 0) {
+            return;
+        }
+
+        float frame_sorted[benchmark_max_samples_] {};
+        float overlay_sorted[benchmark_max_samples_] {};
+        float frame_total = 0.0f;
+        float overlay_total = 0.0f;
+        for (int i = 0; i < benchmark_sample_count_; ++i) {
+            frame_sorted[i] = benchmark_frame_samples_[i];
+            overlay_sorted[i] = benchmark_overlay_samples_[i];
+            frame_total += benchmark_frame_samples_[i];
+            overlay_total += benchmark_overlay_samples_[i];
+        }
+        std::sort(frame_sorted, frame_sorted + benchmark_sample_count_);
+        std::sort(overlay_sorted, overlay_sorted + benchmark_sample_count_);
+
+        const float frame_average = frame_total / static_cast<float>(benchmark_sample_count_);
+        const float overlay_average = overlay_total / static_cast<float>(benchmark_sample_count_);
+        const int p95 = benchmark_percentile_index(benchmark_sample_count_, 0.95f);
+        const int p99 = benchmark_percentile_index(benchmark_sample_count_, 0.99f);
+        const float sample_scale = 1.0f / static_cast<float>(benchmark_sample_count_);
+
+        FILE* file = std::fopen(benchmark_path_, "wb");
+        if (!file) {
+            return;
+        }
+
+        std::fprintf(file,
+            "{\"lines\":%d,\"samples\":%d,\"fps\":%.3f,"
+            "\"frame_avg_ms\":%.3f,\"frame_p95_ms\":%.3f,\"frame_p99_ms\":%.3f,\"frame_max_ms\":%.3f,"
+            "\"overlay_avg_ms\":%.3f,\"overlay_p95_ms\":%.3f,\"overlay_p99_ms\":%.3f,\"overlay_max_ms\":%.3f,"
+            "\"projections_per_frame\":%.3f,\"draw_calls_per_frame\":%.3f,\"state_reads_per_frame\":%.3f}\n",
+            benchmark_line_count_, benchmark_sample_count_, frame_average > 0.0f ? 1000.0f / frame_average : 0.0f,
+            frame_average, frame_sorted[p95], frame_sorted[p99], frame_sorted[benchmark_sample_count_ - 1],
+            overlay_average, overlay_sorted[p95], overlay_sorted[p99], overlay_sorted[benchmark_sample_count_ - 1],
+            static_cast<float>(benchmark_projection_total_) * sample_scale,
+            static_cast<float>(benchmark_draw_call_total_) * sample_scale,
+            static_cast<float>(benchmark_state_read_total_) * sample_scale);
+        std::fclose(file);
+    }
+
+    void record_benchmark_sample(float frame_ms, float overlay_ms) {
+        const DWORD now_ms = GetTickCount();
+        if (benchmark_skip_next_sample_) {
+            benchmark_skip_next_sample_ = false;
+            return;
+        }
+        if (frame_ms <= 0.0f || overlay_ms < 0.0f) {
+            return;
+        }
+
+        if (benchmark_sample_count_ >= benchmark_max_samples_) {
+            write_benchmark_report();
+            reset_benchmark_samples(now_ms);
+        }
+
+        benchmark_frame_samples_[benchmark_sample_count_] = frame_ms;
+        benchmark_overlay_samples_[benchmark_sample_count_] = overlay_ms;
+        ++benchmark_sample_count_;
+        benchmark_projection_total_ += benchmark_current_projections_;
+        benchmark_draw_call_total_ += benchmark_current_draw_calls_;
+        benchmark_state_read_total_ += benchmark_current_state_reads_;
+
+        if (benchmark_sample_count_ >= 30 && now_ms - benchmark_last_report_ms_ >= 2000) {
+            write_benchmark_report();
+            reset_benchmark_samples(now_ms);
+            benchmark_skip_next_sample_ = true;
+        }
+    }
+
+    int read_lines(LineState* lines, int max_lines) {
+        if (!state_file_may_have_changed()) {
+            return copy_cached_lines(lines, max_lines);
+        }
+
+        WIN32_FILE_ATTRIBUTE_DATA attributes_before {};
+        if (!GetFileAttributesExA(state_path_, GetFileExInfoStandard, &attributes_before)) {
+            state_cache_valid_ = false;
+            set_benchmark_state(false, 0);
+            return 0;
+        }
+
+        ULARGE_INTEGER write_time_before {};
+        write_time_before.LowPart = attributes_before.ftLastWriteTime.dwLowDateTime;
+        write_time_before.HighPart = attributes_before.ftLastWriteTime.dwHighDateTime;
+        const unsigned long long file_size_before =
+            (static_cast<unsigned long long>(attributes_before.nFileSizeHigh) << 32)
+            | attributes_before.nFileSizeLow;
+
+        if (state_cache_valid_
+            && cached_state_write_time_ == write_time_before.QuadPart
+            && cached_state_file_size_ == file_size_before) {
+            return copy_cached_lines(lines, max_lines);
+        }
+
+        FILE* file = std::fopen(state_path_, "rb");
+        if (!file) {
+            return state_cache_valid_ ? copy_cached_lines(lines, max_lines) : 0;
+        }
+
+        ++benchmark_current_state_reads_;
+        char buffer[131072] {};
         const std::size_t read = std::fread(buffer, 1, sizeof(buffer) - 1, file);
         std::fclose(file);
         buffer[read] = '\0';
 
-        if (std::strstr(buffer, "\"source\"") == nullptr) {
-            return 0;
+        std::size_t content_end = read;
+        while (content_end > 0 && (buffer[content_end - 1] == ' ' || buffer[content_end - 1] == '\t'
+            || buffer[content_end - 1] == '\r' || buffer[content_end - 1] == '\n')) {
+            --content_end;
+        }
+        if (file_size_before >= sizeof(buffer) || content_end == 0 || buffer[0] != '{'
+            || buffer[content_end - 1] != '}') {
+            return state_cache_valid_ ? copy_cached_lines(lines, max_lines) : 0;
         }
 
-        const char* settings = std::strstr(buffer, "\"settings\"");
+        const char* benchmark = std::strstr(buffer, "\"benchmark\"");
+        const bool benchmark_enabled = benchmark && parse_json_bool(benchmark, "\"enabled\"");
+        const int benchmark_lines = benchmark
+            ? static_cast<int>(parse_json_uint(benchmark, "\"lines\""))
+            : 0;
+        set_benchmark_state(benchmark_enabled, benchmark_lines);
+
+        const bool has_lines = std::strstr(buffer, "\"source\"") != nullptr;
+
+        const char* settings = has_lines ? std::strstr(buffer, "\"settings\"") : nullptr;
         if (settings) {
             const float opacity = parse_json_float(settings, "\"opacity\"");
             if (opacity >= 0.0f && opacity <= 1.0f) {
@@ -1889,20 +2129,72 @@ private:
         }
         boneprobe_requested_ = std::strstr(buffer, "\"boneprobe\":true") != nullptr;
 
+        LineState parsed_lines[128] {};
         int count = 0;
-        const char* lines_array = std::strstr(buffer, "\"lines\"");
+        const int render_limit = benchmark_enabled_ ? max_lines : std::min(max_lines, 16);
+        const char* lines_array = has_lines ? std::strstr(buffer, "\"lines\"") : nullptr;
         if (lines_array) {
-            count = parse_line_array(lines_array, lines, max_lines);
+            count = parse_line_array(lines_array, parsed_lines, render_limit);
         }
 
         if (count == 0) {
             const char* probe_lines_array = std::strstr(buffer, "\"probe_lines\"");
             if (probe_lines_array) {
-                count = parse_line_array(probe_lines_array, lines, max_lines);
+                count = parse_line_array(probe_lines_array, parsed_lines, render_limit);
             }
         }
 
+        cached_line_count_ = std::min(count, 128);
+        for (int i = 0; i < cached_line_count_; ++i) {
+            cached_lines_[i] = parsed_lines[i];
+        }
+        state_cache_valid_ = true;
+
+        WIN32_FILE_ATTRIBUTE_DATA attributes_after {};
+        if (GetFileAttributesExA(state_path_, GetFileExInfoStandard, &attributes_after)) {
+            ULARGE_INTEGER write_time_after {};
+            write_time_after.LowPart = attributes_after.ftLastWriteTime.dwLowDateTime;
+            write_time_after.HighPart = attributes_after.ftLastWriteTime.dwHighDateTime;
+            const unsigned long long file_size_after =
+                (static_cast<unsigned long long>(attributes_after.nFileSizeHigh) << 32)
+                | attributes_after.nFileSizeLow;
+            if (write_time_after.QuadPart == write_time_before.QuadPart
+                && file_size_after == file_size_before) {
+                cached_state_write_time_ = write_time_after.QuadPart;
+                cached_state_file_size_ = file_size_after;
+            }
+        }
+
+        return copy_cached_lines(lines, max_lines);
+    }
+
+    int copy_cached_lines(LineState* lines, int max_lines) const {
+        const int count = std::min(cached_line_count_, max_lines);
+        for (int i = 0; i < count; ++i) {
+            lines[i] = cached_lines_[i];
+        }
         return count;
+    }
+
+    bool state_file_may_have_changed() {
+        if (!state_cache_valid_ || state_change_notification_ == INVALID_HANDLE_VALUE) {
+            return true;
+        }
+
+        const DWORD wait_result = WaitForSingleObject(state_change_notification_, 0);
+        if (wait_result == WAIT_TIMEOUT) {
+            return false;
+        }
+
+        if (wait_result == WAIT_OBJECT_0) {
+            if (!FindNextChangeNotification(state_change_notification_)) {
+                close_state_change_notification();
+            }
+            return true;
+        }
+
+        close_state_change_notification();
+        return true;
     }
 
     int parse_line_array(const char* array_start, LineState* lines, int max_lines) {
@@ -2013,17 +2305,83 @@ private:
         return std::strncmp(colon, "true", 4) == 0;
     }
 
-    bool live_world_to_screen(float lua_x, float lua_y, float lua_z, const D3DVIEWPORT8& viewport, float& screen_x, float& screen_y) {
+    bool refresh_projection_matrices() {
         if (!d3d_device_) {
             return false;
         }
 
-        D3DMATRIX view {};
-        D3DMATRIX projection {};
-        if (FAILED(d3d_device_->GetTransform(D3DTS_VIEW, &view)) ||
-            FAILED(d3d_device_->GetTransform(D3DTS_PROJECTION, &projection))) {
+        if (FAILED(d3d_device_->GetTransform(D3DTS_VIEW, &cached_view_)) ||
+            FAILED(d3d_device_->GetTransform(D3DTS_PROJECTION, &cached_projection_))) {
+            projection_matrices_valid_ = false;
             return false;
         }
+
+        for (int row = 0; row < 4; ++row) {
+            for (int column = 0; column < 4; ++column) {
+                cached_view_projection_.m[row][column] =
+                    cached_view_.m[row][0] * cached_projection_.m[0][column]
+                    + cached_view_.m[row][1] * cached_projection_.m[1][column]
+                    + cached_view_.m[row][2] * cached_projection_.m[2][column]
+                    + cached_view_.m[row][3] * cached_projection_.m[3][column];
+            }
+        }
+
+        projection_matrices_valid_ = true;
+        return true;
+    }
+
+    bool resolve_dynamic_anchor_cached(std::uintptr_t mob_array, bool is_npc, DWORD index, int bone,
+        float& lua_x, float& lua_y, float& lua_z) {
+        if (mob_array == 0 || !is_npc || index == 0 || index >= 0x900) {
+            return false;
+        }
+
+        for (int i = 0; i < anchor_cache_count_; ++i) {
+            const AnchorCacheEntry& entry = anchor_cache_[i];
+            if (entry.index != index || entry.bone != bone) {
+                continue;
+            }
+
+            if (entry.resolved) {
+                lua_x = entry.x;
+                lua_y = entry.y;
+                lua_z = entry.z;
+            }
+            return entry.resolved;
+        }
+
+        float resolved_x = lua_x;
+        float resolved_y = lua_y;
+        float resolved_z = lua_z;
+        const bool resolved = resolve_dynamic_anchor(mob_array, is_npc, index, bone,
+            resolved_x, resolved_y, resolved_z);
+        if (anchor_cache_count_ < max_anchor_cache_entries_) {
+            AnchorCacheEntry& entry = anchor_cache_[anchor_cache_count_++];
+            entry.index = index;
+            entry.bone = bone;
+            entry.resolved = resolved;
+            entry.x = resolved_x;
+            entry.y = resolved_y;
+            entry.z = resolved_z;
+        }
+
+        if (resolved) {
+            lua_x = resolved_x;
+            lua_y = resolved_y;
+            lua_z = resolved_z;
+        }
+        return resolved;
+    }
+
+    bool live_world_to_screen(float lua_x, float lua_y, float lua_z, const D3DVIEWPORT8& viewport, float& screen_x, float& screen_y) {
+        if (benchmark_enabled_) {
+            ++benchmark_current_projections_;
+        }
+        if (!projection_matrices_valid_) {
+            return false;
+        }
+
+        const D3DMATRIX& view_projection = cached_view_projection_;
 
         // FFXI Lua positions use x/y as ground-plane coordinates and z as height.
         // D3D's observed model translations map those to x/z ground-plane and y height.
@@ -2031,14 +2389,12 @@ private:
         const float world_y = lua_z;
         const float world_z = lua_y;
 
-        const float view_x = world_x * view.m[0][0] + world_y * view.m[1][0] + world_z * view.m[2][0] + view.m[3][0];
-        const float view_y = world_x * view.m[0][1] + world_y * view.m[1][1] + world_z * view.m[2][1] + view.m[3][1];
-        const float view_z = world_x * view.m[0][2] + world_y * view.m[1][2] + world_z * view.m[2][2] + view.m[3][2];
-        const float view_w = world_x * view.m[0][3] + world_y * view.m[1][3] + world_z * view.m[2][3] + view.m[3][3];
-
-        const float clip_x = view_x * projection.m[0][0] + view_y * projection.m[1][0] + view_z * projection.m[2][0] + view_w * projection.m[3][0];
-        const float clip_y = view_x * projection.m[0][1] + view_y * projection.m[1][1] + view_z * projection.m[2][1] + view_w * projection.m[3][1];
-        const float clip_w = view_x * projection.m[0][3] + view_y * projection.m[1][3] + view_z * projection.m[2][3] + view_w * projection.m[3][3];
+        const float clip_x = world_x * view_projection.m[0][0] + world_y * view_projection.m[1][0]
+            + world_z * view_projection.m[2][0] + view_projection.m[3][0];
+        const float clip_y = world_x * view_projection.m[0][1] + world_y * view_projection.m[1][1]
+            + world_z * view_projection.m[2][1] + view_projection.m[3][1];
+        const float clip_w = world_x * view_projection.m[0][3] + world_y * view_projection.m[1][3]
+            + world_z * view_projection.m[2][3] + view_projection.m[3][3];
 
         if (std::fabs(clip_w) <= 0.0001f) {
             return false;
@@ -2055,29 +2411,10 @@ private:
         return true;
     }
 
-    void append_segment_quad(DrawVertex* vertices, int& vertex_count, float x1, float y1, float x2, float y2, float thickness, DWORD color, float trim_end) {
-        const float dx = x2 - x1;
-        const float dy = y2 - y1;
-        const float length = std::sqrt(dx * dx + dy * dy);
-        if (length <= 0.01f) {
-            return;
-        }
-
-        if (trim_end > 0.0f) {
-            const float visible_length = std::fmax(0.01f, length - trim_end);
-            x2 = x1 + (dx / length) * visible_length;
-            y2 = y1 + (dy / length) * visible_length;
-        }
-
-        const float clipped_dx = x2 - x1;
-        const float clipped_dy = y2 - y1;
-        const float clipped_length = std::sqrt(clipped_dx * clipped_dx + clipped_dy * clipped_dy);
-        if (clipped_length <= 0.01f) {
-            return;
-        }
-
-        const float nx = -clipped_dy / clipped_length * thickness * 0.5f;
-        const float ny = clipped_dx / clipped_length * thickness * 0.5f;
+    void append_segment_quad_with_normal(DrawVertex* vertices, int& vertex_count, float x1, float y1,
+        float x2, float y2, float normal_x, float normal_y, float thickness, DWORD color) {
+        const float nx = normal_x * thickness * 0.5f;
+        const float ny = normal_y * thickness * 0.5f;
 
         const DrawVertex a {x1 + nx, y1 + ny, 0.0f, 1.0f, color};
         const DrawVertex b {x1 - nx, y1 - ny, 0.0f, 1.0f, color};
@@ -2092,9 +2429,12 @@ private:
         vertices[vertex_count++] = d;
     }
 
-    void append_segment_quad_clipped_to_circle(DrawVertex* vertices, int& vertex_count, float x1, float y1, float x2, float y2, float thickness, DWORD color, float circle_x, float circle_y, float radius) {
+    void append_segment_quad_clipped_to_circle(DrawVertex* vertices, int& vertex_count, float x1, float y1,
+        float x2, float y2, float segment_dx, float segment_dy, float segment_length, float segment_length_sq,
+        float normal_x, float normal_y, float thickness, DWORD color, float circle_x, float circle_y, float radius) {
         if (radius <= 0.0f) {
-            append_segment_quad(vertices, vertex_count, x1, y1, x2, y2, thickness, color, 0.0f);
+            append_segment_quad_with_normal(vertices, vertex_count, x1, y1, x2, y2,
+                normal_x, normal_y, thickness, color);
             return;
         }
 
@@ -2111,14 +2451,13 @@ private:
         }
 
         if (start_distance_sq > radius_sq && end_distance_sq > radius_sq) {
-            append_segment_quad(vertices, vertex_count, x1, y1, x2, y2, thickness, color, 0.0f);
+            append_segment_quad_with_normal(vertices, vertex_count, x1, y1, x2, y2,
+                normal_x, normal_y, thickness, color);
             return;
         }
 
-        const float dx = x2 - x1;
-        const float dy = y2 - y1;
-        const float a = dx * dx + dy * dy;
-        const float b = 2.0f * (sx * dx + sy * dy);
+        const float a = segment_length_sq;
+        const float b = 2.0f * (sx * segment_dx + sy * segment_dy);
         const float c = start_distance_sq - radius_sq;
         const float discriminant = b * b - 4.0f * a * c;
         if (a <= 0.0001f || discriminant < 0.0f) {
@@ -2139,41 +2478,43 @@ private:
             return;
         }
 
-        const float ix = x1 + dx * t;
-        const float iy = y1 + dy * t;
+        const float ix = x1 + segment_dx * t;
+        const float iy = y1 + segment_dy * t;
         if (start_distance_sq > radius_sq) {
-            append_segment_quad(vertices, vertex_count, x1, y1, ix, iy, thickness, color, 0.0f);
+            if (segment_length * t > 0.01f) {
+                append_segment_quad_with_normal(vertices, vertex_count, x1, y1, ix, iy,
+                    normal_x, normal_y, thickness, color);
+            }
         } else {
-            append_segment_quad(vertices, vertex_count, ix, iy, x2, y2, thickness, color, 0.0f);
+            if (segment_length * (1.0f - t) > 0.01f) {
+                append_segment_quad_with_normal(vertices, vertex_count, ix, iy, x2, y2,
+                    normal_x, normal_y, thickness, color);
+            }
         }
     }
 
-    void draw_vertices(D3DPRIMITIVETYPE primitive_type, UINT primitive_count, const DrawVertex* vertices, UINT stride) {
+    bool begin_draw_state() {
+        if (draw_state_active_) {
+            return true;
+        }
+
         if (!d3d_device_) {
             probe_device("draw");
         }
 
         if (!d3d_device_) {
-            return;
+            return false;
         }
 
-        DWORD old_shader = 0;
-        DWORD old_alpha = 0;
-        DWORD old_src = 0;
-        DWORD old_dest = 0;
-        DWORD old_z = 0;
-        DWORD old_lighting = 0;
-        DWORD old_cull = 0;
-        IDirect3DBaseTexture8* old_texture = nullptr;
-
-        d3d_device_->GetVertexShader(&old_shader);
-        d3d_device_->GetRenderState(D3DRS_ALPHABLENDENABLE, &old_alpha);
-        d3d_device_->GetRenderState(D3DRS_SRCBLEND, &old_src);
-        d3d_device_->GetRenderState(D3DRS_DESTBLEND, &old_dest);
-        d3d_device_->GetRenderState(D3DRS_ZENABLE, &old_z);
-        d3d_device_->GetRenderState(D3DRS_LIGHTING, &old_lighting);
-        d3d_device_->GetRenderState(D3DRS_CULLMODE, &old_cull);
-        d3d_device_->GetTexture(0, &old_texture);
+        saved_texture_ = nullptr;
+        d3d_device_->GetVertexShader(&saved_shader_);
+        d3d_device_->GetRenderState(D3DRS_ALPHABLENDENABLE, &saved_alpha_);
+        d3d_device_->GetRenderState(D3DRS_SRCBLEND, &saved_src_);
+        d3d_device_->GetRenderState(D3DRS_DESTBLEND, &saved_dest_);
+        d3d_device_->GetRenderState(D3DRS_ZENABLE, &saved_z_);
+        d3d_device_->GetRenderState(D3DRS_LIGHTING, &saved_lighting_);
+        d3d_device_->GetRenderState(D3DRS_CULLMODE, &saved_cull_);
+        d3d_device_->GetTexture(0, &saved_texture_);
 
         d3d_device_->SetTexture(0, nullptr);
         d3d_device_->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
@@ -2183,19 +2524,87 @@ private:
         d3d_device_->SetRenderState(D3DRS_LIGHTING, FALSE);
         d3d_device_->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
         d3d_device_->SetVertexShader(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+
+        draw_state_active_ = true;
+        return true;
+    }
+
+    void end_draw_state() {
+        if (!draw_state_active_ || !d3d_device_) {
+            return;
+        }
+
+        d3d_device_->SetTexture(0, saved_texture_);
+        if (saved_texture_) {
+            saved_texture_->Release();
+            saved_texture_ = nullptr;
+        }
+        d3d_device_->SetRenderState(D3DRS_ALPHABLENDENABLE, saved_alpha_);
+        d3d_device_->SetRenderState(D3DRS_SRCBLEND, saved_src_);
+        d3d_device_->SetRenderState(D3DRS_DESTBLEND, saved_dest_);
+        d3d_device_->SetRenderState(D3DRS_ZENABLE, saved_z_);
+        d3d_device_->SetRenderState(D3DRS_LIGHTING, saved_lighting_);
+        d3d_device_->SetRenderState(D3DRS_CULLMODE, saved_cull_);
+        d3d_device_->SetVertexShader(saved_shader_);
+        draw_state_active_ = false;
+    }
+
+    void begin_line_batch() {
+        line_batch_vertex_count_ = 0;
+        line_batch_active_ = true;
+    }
+
+    void flush_line_batch() {
+        if (line_batch_vertex_count_ <= 0) {
+            return;
+        }
+
+        submit_vertices(D3DPT_TRIANGLELIST, static_cast<UINT>(line_batch_vertex_count_ / 3),
+            line_batch_vertices_, sizeof(DrawVertex));
+        line_batch_vertex_count_ = 0;
+    }
+
+    void end_line_batch() {
+        flush_line_batch();
+        line_batch_active_ = false;
+    }
+
+    void draw_vertices(D3DPRIMITIVETYPE primitive_type, UINT primitive_count, const DrawVertex* vertices, UINT stride) {
+        if (line_batch_active_ && primitive_type == D3DPT_TRIANGLELIST && stride == sizeof(DrawVertex)) {
+            const UINT vertex_count = primitive_count * 3;
+            if (vertex_count > static_cast<UINT>(max_line_batch_vertices_)) {
+                flush_line_batch();
+                submit_vertices(primitive_type, primitive_count, vertices, stride);
+                return;
+            }
+
+            if (line_batch_vertex_count_ + static_cast<int>(vertex_count) > max_line_batch_vertices_) {
+                flush_line_batch();
+            }
+            std::memcpy(line_batch_vertices_ + line_batch_vertex_count_, vertices,
+                static_cast<std::size_t>(vertex_count) * sizeof(DrawVertex));
+            line_batch_vertex_count_ += static_cast<int>(vertex_count);
+            return;
+        }
+
+        submit_vertices(primitive_type, primitive_count, vertices, stride);
+    }
+
+    void submit_vertices(D3DPRIMITIVETYPE primitive_type, UINT primitive_count, const DrawVertex* vertices, UINT stride) {
+        if (benchmark_enabled_) {
+            ++benchmark_current_draw_calls_;
+        }
+
+        const bool owns_draw_state = !draw_state_active_;
+        if (owns_draw_state && !begin_draw_state()) {
+            return;
+        }
+
         d3d_device_->DrawPrimitiveUP(primitive_type, primitive_count, vertices, stride);
 
-        d3d_device_->SetTexture(0, old_texture);
-        if (old_texture) {
-            old_texture->Release();
+        if (owns_draw_state) {
+            end_draw_state();
         }
-        d3d_device_->SetRenderState(D3DRS_ALPHABLENDENABLE, old_alpha);
-        d3d_device_->SetRenderState(D3DRS_SRCBLEND, old_src);
-        d3d_device_->SetRenderState(D3DRS_DESTBLEND, old_dest);
-        d3d_device_->SetRenderState(D3DRS_ZENABLE, old_z);
-        d3d_device_->SetRenderState(D3DRS_LIGHTING, old_lighting);
-        d3d_device_->SetRenderState(D3DRS_CULLMODE, old_cull);
-        d3d_device_->SetVertexShader(old_shader);
     }
 
     void initialize_paths_from_module() {
@@ -2217,6 +2626,18 @@ private:
         CreateDirectoryA(settings_root, nullptr);
         std::snprintf(log_path_, sizeof(log_path_), "%s\\settings\\TargetLines\\native.log", module_path);
         std::snprintf(state_path_, sizeof(state_path_), "%s\\settings\\TargetLines\\lines.json", module_path);
+        std::snprintf(benchmark_path_, sizeof(benchmark_path_), "%s\\settings\\TargetLines\\benchmark.json", module_path);
+        state_change_notification_ = FindFirstChangeNotificationA(
+            settings_root,
+            FALSE,
+            FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE);
+    }
+
+    void close_state_change_notification() {
+        if (state_change_notification_ != INVALID_HANDLE_VALUE) {
+            FindCloseChangeNotification(state_change_notification_);
+            state_change_notification_ = INVALID_HANDLE_VALUE;
+        }
     }
 
     void append_log(const char* message) {
@@ -2243,6 +2664,9 @@ private:
     }
 
     int count_lines() {
+        if (benchmark_enabled_) {
+            ++benchmark_current_state_reads_;
+        }
         FILE* file = std::fopen(state_path_, "rb");
         if (!file) {
             return -static_cast<int>(errno);
@@ -2271,9 +2695,27 @@ private:
     }
     char state_path_[1024] {};
     char log_path_[1024] {};
+    char benchmark_path_[1024] {};
+    HANDLE state_change_notification_ = INVALID_HANDLE_VALUE;
     unsigned long postrender_calls_ = 0;
-    int last_line_count_ = 0;
     IDirect3DDevice8* d3d_device_ = nullptr;
+    D3DMATRIX cached_view_ {};
+    D3DMATRIX cached_projection_ {};
+    D3DMATRIX cached_view_projection_ {};
+    bool projection_matrices_valid_ = false;
+    DWORD saved_shader_ = 0;
+    DWORD saved_alpha_ = 0;
+    DWORD saved_src_ = 0;
+    DWORD saved_dest_ = 0;
+    DWORD saved_z_ = 0;
+    DWORD saved_lighting_ = 0;
+    DWORD saved_cull_ = 0;
+    IDirect3DBaseTexture8* saved_texture_ = nullptr;
+    bool draw_state_active_ = false;
+    static constexpr int max_line_batch_vertices_ = 32760;
+    DrawVertex line_batch_vertices_[max_line_batch_vertices_] {};
+    int line_batch_vertex_count_ = 0;
+    bool line_batch_active_ = false;
     bool overlay_enabled_ = true;
     bool debug_bar_enabled_ = false;
     bool matrix_probe_pending_ = false;
@@ -2284,9 +2726,37 @@ private:
     float width_scale_ = 1.0f;
     float glow_scale_ = 1.0f;
     int dynamic_bone_ = 21;
+    static constexpr int benchmark_max_samples_ = 1024;
+    LARGE_INTEGER performance_frequency_ {};
+    LONGLONG previous_postrender_counter_ = 0;
+    bool benchmark_enabled_ = false;
+    bool benchmark_skip_next_sample_ = false;
+    int benchmark_line_count_ = 0;
+    int benchmark_sample_count_ = 0;
+    DWORD benchmark_last_report_ms_ = 0;
+    float benchmark_frame_samples_[benchmark_max_samples_] {};
+    float benchmark_overlay_samples_[benchmark_max_samples_] {};
+    unsigned long long benchmark_projection_total_ = 0;
+    unsigned long long benchmark_draw_call_total_ = 0;
+    unsigned long long benchmark_state_read_total_ = 0;
+    unsigned int benchmark_current_projections_ = 0;
+    unsigned int benchmark_current_draw_calls_ = 0;
+    unsigned int benchmark_current_state_reads_ = 0;
+    LineState cached_lines_[128] {};
+    int cached_line_count_ = 0;
+    unsigned long long cached_state_write_time_ = 0;
+    unsigned long long cached_state_file_size_ = 0;
+    bool state_cache_valid_ = false;
     bool boneprobe_requested_ = false;
     DWORD last_boneprobe_ms_ = 0;
-    static constexpr int max_active_lines_ = 64;
+    static constexpr int max_anchor_cache_entries_ = 256;
+    AnchorCacheEntry anchor_cache_[max_anchor_cache_entries_] {};
+    int anchor_cache_count_ = 0;
+    float head_unit_x_[head_marker_slices_ + 1] {};
+    float head_unit_y_[head_marker_slices_ + 1] {};
+    float cap_unit_x_[round_cap_slices_ + 1] {};
+    float cap_unit_y_[round_cap_slices_ + 1] {};
+    static constexpr int max_active_lines_ = 128;
     ActiveLine active_lines_[max_active_lines_] {};
     int active_line_count_ = 0;
 };
