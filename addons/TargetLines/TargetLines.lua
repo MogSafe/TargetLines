@@ -102,6 +102,11 @@ local inspect_path = windower.addon_path .. 'inspect.log'
 local runtime_log_path = windower.addon_path .. 'runtime.log'
 local last_write = 0
 local last_signature = ''
+local last_state_maintenance = 0
+local state_maintenance_interval = 0.25
+local next_line_expiration = 0
+local last_benchmark_input_signature = nil
+local last_boneprobe_active = false
 local last_benchmark_stats_read = 0
 local benchmark_stats = nil
 local last_lines = {}
@@ -1073,6 +1078,7 @@ local function add_recent_line(source, target, kind, color, timeout, options)
         timeout = timeout or effective_timeout(),
     }
     probe_lines = {recent_lines[key]}
+    last_signature = ''
     return true, key
 end
 
@@ -1397,6 +1403,7 @@ local function collect_lines()
     local lines = {}
     local now = os.clock()
     local party = party_ids()
+    local next_expiration = 0
 
     for key, line in pairs(recent_lines) do
         local age = now - (line.created or now)
@@ -1405,6 +1412,10 @@ local function collect_lines()
             recent_lines[key] = nil
         else
             lines[#lines + 1] = line
+            local expires_at = (line.created or now) + timeout
+            if next_expiration == 0 or expires_at < next_expiration then
+                next_expiration = expires_at
+            end
         end
     end
 
@@ -1462,16 +1473,16 @@ local function collect_lines()
         return (left.created or 0) > (right.created or 0)
     end)
 
-    return lines, nearby
+    return lines, nearby, next_expiration
 end
 
-local function collect_benchmark_lines(count)
-    local source = player_point(windower.ffxi.get_player())
+local function collect_benchmark_lines(count, source, generation)
+    source = source or player_point(windower.ffxi.get_player())
     local colors = active_colors()
     local color = scale_color_alpha(colors.player, tonumber(settings.fan_opacity_scale) or defaults.fan_opacity_scale)
     local lines = {}
     local full_circle = math.pi * 2
-    local generation = math.floor(os.clock() / 5) % 100000
+    generation = generation or (math.floor(os.clock() / 5) % 100000)
 
     for index = 1, count do
         local angle = full_circle * (index - 1) / math.max(count, 1)
@@ -1623,7 +1634,6 @@ end
 
 local function encode_state(lines)
     local info = windower.ffxi.get_info() or {}
-    local observer = player_point(windower.ffxi.get_player())
     local parts = {
         ('"zone":%u'):format(tonumber(info.zone) or 0),
         ',',
@@ -1639,8 +1649,6 @@ local function encode_state(lines)
             benchmark_enabled() and 'true' or 'false', math.max(benchmark_line_count(), 0)),
         ',',
         ('"boneprobe":%s'):format(os.clock() < boneprobe_until and 'true' or 'false'),
-        ',',
-        ('"observer":%s'):format(point_json(observer)),
         ',',
         '"lines":[',
     }
@@ -1738,16 +1746,41 @@ windower.register_event('prerender', function()
     end
 
     last_write = now
-    local lines, nearby = collect_lines()
     local benchmark_count = benchmark_line_count()
+    local benchmark_source = nil
+    local benchmark_generation = nil
+    local benchmark_input_signature = nil
     if benchmark_count >= 0 then
-        lines = collect_benchmark_lines(benchmark_count)
+        benchmark_source = player_point(windower.ffxi.get_player())
+        benchmark_generation = math.floor(now / 5) % 100000
+        benchmark_input_signature = ('%u:%u:%s'):format(
+            benchmark_count, benchmark_generation, point_json(benchmark_source))
     end
-    last_lines = lines
-    last_nearby = nearby
-    write_state(lines)
-    update_auto_inspect(nearby)
-    update_debug(lines)
+
+    local boneprobe_active = now < boneprobe_until
+    local state_invalidated = last_signature == ''
+        or boneprobe_active ~= last_boneprobe_active
+        or benchmark_input_signature ~= last_benchmark_input_signature
+    local expiration_due = next_line_expiration > 0 and now >= next_line_expiration
+    local maintenance_due = now - last_state_maintenance >= state_maintenance_interval
+    local rebuild_state = state_invalidated or expiration_due or maintenance_due or settings.claim_fallback == true
+
+    if rebuild_state then
+        local lines, nearby, expiration = collect_lines()
+        last_state_maintenance = now
+        next_line_expiration = expiration
+        last_nearby = nearby
+        if benchmark_count >= 0 then
+            lines = collect_benchmark_lines(benchmark_count, benchmark_source, benchmark_generation)
+        end
+        last_lines = lines
+        write_state(lines)
+    end
+
+    last_benchmark_input_signature = benchmark_input_signature
+    last_boneprobe_active = boneprobe_active
+    update_auto_inspect(last_nearby)
+    update_debug(last_lines)
     update_config_box()
 end)
 
@@ -2043,6 +2076,7 @@ windower.register_event('addon command', function(command, ...)
         end
 
         config.save(settings)
+        last_signature = ''
         update_config_box()
         log('TargetLines claim fallback ' .. (settings.claim_fallback and 'enabled.' or 'disabled.'))
     elseif command == 'autoinspect' or command == 'inspectauto' then

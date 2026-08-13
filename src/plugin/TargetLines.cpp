@@ -90,6 +90,7 @@ public:
 
     void __stdcall Unload() override {
         append_log("unloaded");
+        close_state_change_notification();
     }
 
     void __stdcall PluginCommand(const char* command) override {
@@ -871,12 +872,16 @@ private:
         }
         anchor_cache_count_ = 0;
 
+        const DWORD now_ms = GetTickCount();
+        bool spread_sources[128] {};
+        bool spread_targets[128] {};
+        prepare_new_line_relationships(lines, line_count, spread_sources, spread_targets);
+
         if (!begin_draw_state()) {
             return;
         }
 
         begin_line_batch();
-        const DWORD now_ms = GetTickCount();
         for (int i = 0; i < line_count; ++i) {
             ActiveLine* active = nullptr;
             float progress = 1.0f;
@@ -884,7 +889,7 @@ private:
             float settle = 0.0f;
             float tail = 0.0f;
             DWORD color = lines[i].color;
-            if (!prepare_animated_line(lines[i], lines, line_count, i, now_ms, active, progress, arc_settle, settle, tail, color)) {
+            if (!prepare_animated_line(lines[i], now_ms, spread_sources[i], spread_targets[i], active, progress, arc_settle, settle, tail, color)) {
                 continue;
             }
 
@@ -898,14 +903,14 @@ private:
         prune_active_lines(now_ms);
     }
 
-    bool prepare_animated_line(const LineState& line, const LineState* lines, int line_count, int index, DWORD now_ms, ActiveLine*& active, float& progress, float& arc_settle, float& settle, float& tail, DWORD& color) {
+    bool prepare_animated_line(const LineState& line, DWORD now_ms, bool spread_source, bool spread_target, ActiveLine*& active, float& progress, float& arc_settle, float& settle, float& tail, DWORD& color) {
         const unsigned long long key = line_key(line);
         active = find_active_line(key);
         if (!active) {
             active = allocate_active_line(key, now_ms);
             if (active) {
-                active->spread_source = source_continues_from_existing_target(lines, line_count, index);
-                active->spread_target = shared_target_line(lines, line_count, index);
+                active->spread_source = spread_source;
+                active->spread_target = spread_target;
             }
         }
 
@@ -1154,32 +1159,32 @@ private:
         return index < other_index;
     }
 
-    bool source_continues_from_existing_target(const LineState* lines, int line_count, int index) const {
-        if (!lines || index < 0 || index >= line_count) {
-            return false;
+    void prepare_new_line_relationships(const LineState* lines, int line_count, bool* spread_sources, bool* spread_targets) {
+        if (!lines || !spread_sources || !spread_targets || line_count <= 0) {
+            return;
         }
 
-        for (int i = 0; i < line_count; ++i) {
-            if (i != index && line_is_newer_than(lines[index], lines[i], index, i) && source_matches_target(lines[index], lines[i])) {
-                return true;
+        for (int index = 0; index < line_count; ++index) {
+            if (find_active_line(line_key(lines[index]))) {
+                continue;
+            }
+
+            for (int other_index = 0; other_index < line_count; ++other_index) {
+                if (other_index == index || !line_is_newer_than(lines[index], lines[other_index], index, other_index)) {
+                    continue;
+                }
+
+                if (!spread_sources[index] && source_matches_target(lines[index], lines[other_index])) {
+                    spread_sources[index] = true;
+                }
+                if (!spread_targets[index] && same_target(lines[index], lines[other_index])) {
+                    spread_targets[index] = true;
+                }
+                if (spread_sources[index] && spread_targets[index]) {
+                    break;
+                }
             }
         }
-
-        return false;
-    }
-
-    bool shared_target_line(const LineState* lines, int line_count, int index) const {
-        if (!lines || index < 0 || index >= line_count) {
-            return false;
-        }
-
-        for (int i = 0; i < line_count; ++i) {
-            if (i != index && line_is_newer_than(lines[index], lines[i], index, i) && same_target(lines[index], lines[i])) {
-                return true;
-            }
-        }
-
-        return false;
     }
 
     std::uint32_t mix_u32(std::uint32_t value) const {
@@ -2045,6 +2050,10 @@ private:
     }
 
     int read_lines(LineState* lines, int max_lines) {
+        if (!state_file_may_have_changed()) {
+            return copy_cached_lines(lines, max_lines);
+        }
+
         WIN32_FILE_ATTRIBUTE_DATA attributes_before {};
         if (!GetFileAttributesExA(state_path_, GetFileExInfoStandard, &attributes_before)) {
             state_cache_valid_ = false;
@@ -2165,6 +2174,27 @@ private:
             lines[i] = cached_lines_[i];
         }
         return count;
+    }
+
+    bool state_file_may_have_changed() {
+        if (!state_cache_valid_ || state_change_notification_ == INVALID_HANDLE_VALUE) {
+            return true;
+        }
+
+        const DWORD wait_result = WaitForSingleObject(state_change_notification_, 0);
+        if (wait_result == WAIT_TIMEOUT) {
+            return false;
+        }
+
+        if (wait_result == WAIT_OBJECT_0) {
+            if (!FindNextChangeNotification(state_change_notification_)) {
+                close_state_change_notification();
+            }
+            return true;
+        }
+
+        close_state_change_notification();
+        return true;
     }
 
     int parse_line_array(const char* array_start, LineState* lines, int max_lines) {
@@ -2597,6 +2627,17 @@ private:
         std::snprintf(log_path_, sizeof(log_path_), "%s\\settings\\TargetLines\\native.log", module_path);
         std::snprintf(state_path_, sizeof(state_path_), "%s\\settings\\TargetLines\\lines.json", module_path);
         std::snprintf(benchmark_path_, sizeof(benchmark_path_), "%s\\settings\\TargetLines\\benchmark.json", module_path);
+        state_change_notification_ = FindFirstChangeNotificationA(
+            settings_root,
+            FALSE,
+            FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE);
+    }
+
+    void close_state_change_notification() {
+        if (state_change_notification_ != INVALID_HANDLE_VALUE) {
+            FindCloseChangeNotification(state_change_notification_);
+            state_change_notification_ = INVALID_HANDLE_VALUE;
+        }
     }
 
     void append_log(const char* message) {
@@ -2655,6 +2696,7 @@ private:
     char state_path_[1024] {};
     char log_path_[1024] {};
     char benchmark_path_[1024] {};
+    HANDLE state_change_notification_ = INVALID_HANDLE_VALUE;
     unsigned long postrender_calls_ = 0;
     IDirect3DDevice8* d3d_device_ = nullptr;
     D3DMATRIX cached_view_ {};
