@@ -80,7 +80,6 @@ public:
 
     void __stdcall Load(PluginManager* manager) override {
         plugin_manager_ = manager;
-        QueryPerformanceFrequency(&performance_frequency_);
         initialize_geometry_tables();
         append_module_log("Load called");
         initialize_paths_from_module();
@@ -274,15 +273,6 @@ public:
     }
 
     void __stdcall PostRender() override {
-        LARGE_INTEGER frame_counter {};
-        QueryPerformanceCounter(&frame_counter);
-        const float frame_ms = previous_postrender_counter_ > 0
-            ? counter_milliseconds(frame_counter.QuadPart - previous_postrender_counter_)
-            : 0.0f;
-        previous_postrender_counter_ = frame_counter.QuadPart;
-        benchmark_current_projections_ = 0;
-        benchmark_current_draw_calls_ = 0;
-        benchmark_current_state_reads_ = 0;
         projection_matrices_valid_ = false;
 
         ++postrender_calls_;
@@ -292,15 +282,7 @@ public:
         }
 
         if (overlay_enabled_) {
-            LARGE_INTEGER overlay_start {};
-            LARGE_INTEGER overlay_end {};
-            QueryPerformanceCounter(&overlay_start);
             draw_lines();
-            QueryPerformanceCounter(&overlay_end);
-            if (benchmark_enabled_) {
-                record_benchmark_sample(frame_ms,
-                    counter_milliseconds(overlay_end.QuadPart - overlay_start.QuadPart));
-            }
         }
 
         if (matrix_probe_pending_) {
@@ -970,25 +952,16 @@ private:
 
         const float source_height = model_adjusted_height(source_height_offset_, line.source_model_size, line.source_model_scale, line.source_short_anchor, line.source_floating_anchor, line.source_is_npc);
         const float target_height = model_adjusted_height(target_height_offset_, line.target_model_size, line.target_model_scale, line.target_short_anchor, line.target_floating_anchor, line.target_is_npc);
-        const float serialized_source_x = line.source_x;
-        const float serialized_source_y = line.source_y;
-        const float serialized_source_z = line.source_z + source_height;
-        float p0_x = serialized_source_x;
-        float p0_y = serialized_source_y;
-        float p0_z = serialized_source_z;
+        float p0_x = line.source_x;
+        float p0_y = line.source_y;
+        float p0_z = line.source_z + source_height;
         float p2_x = line.target_x;
         float p2_y = line.target_y;
         float p2_z = line.target_z + target_height;
-        const bool source_resolved = resolve_live_anchor_cached(mob_array, line.source_is_npc, line.source_index,
+        resolve_live_anchor_cached(mob_array, line.source_is_npc, line.source_index,
             dynamic_bone_, source_height, p0_x, p0_y, p0_z);
-        if (benchmark_enabled_ && source_resolved) {
-            p2_x += p0_x - serialized_source_x;
-            p2_y += p0_y - serialized_source_y;
-            p2_z += p0_z - serialized_source_z;
-        } else {
-            resolve_live_anchor_cached(mob_array, line.target_is_npc, line.target_index,
-                dynamic_bone_, target_height, p2_x, p2_y, p2_z);
-        }
+        resolve_live_anchor_cached(mob_array, line.target_is_npc, line.target_index,
+            dynamic_bone_, target_height, p2_x, p2_y, p2_z);
         if (spread_source) {
             apply_source_spread(line, p0_x, p0_y);
         }
@@ -1944,116 +1917,6 @@ private:
         return {base, base + size};
     }
 
-    float counter_milliseconds(LONGLONG ticks) const {
-        if (performance_frequency_.QuadPart <= 0) {
-            return 0.0f;
-        }
-
-        return static_cast<float>(static_cast<double>(ticks) * 1000.0
-            / static_cast<double>(performance_frequency_.QuadPart));
-    }
-
-    void reset_benchmark_samples(DWORD now_ms) {
-        benchmark_sample_count_ = 0;
-        benchmark_projection_total_ = 0;
-        benchmark_draw_call_total_ = 0;
-        benchmark_state_read_total_ = 0;
-        benchmark_last_report_ms_ = now_ms;
-    }
-
-    void set_benchmark_state(bool enabled, int line_count) {
-        line_count = std::max(0, std::min(line_count, 128));
-        if (benchmark_enabled_ == enabled && benchmark_line_count_ == line_count) {
-            return;
-        }
-
-        benchmark_enabled_ = enabled;
-        benchmark_line_count_ = enabled ? line_count : 0;
-        benchmark_skip_next_sample_ = true;
-        reset_benchmark_samples(GetTickCount());
-    }
-
-    int benchmark_percentile_index(int count, float percentile) const {
-        if (count <= 1) {
-            return 0;
-        }
-
-        const int index = static_cast<int>(std::ceil(percentile * static_cast<float>(count))) - 1;
-        return std::max(0, std::min(index, count - 1));
-    }
-
-    void write_benchmark_report() {
-        if (benchmark_path_[0] == '\0' || benchmark_sample_count_ <= 0) {
-            return;
-        }
-
-        float frame_sorted[benchmark_max_samples_] {};
-        float overlay_sorted[benchmark_max_samples_] {};
-        float frame_total = 0.0f;
-        float overlay_total = 0.0f;
-        for (int i = 0; i < benchmark_sample_count_; ++i) {
-            frame_sorted[i] = benchmark_frame_samples_[i];
-            overlay_sorted[i] = benchmark_overlay_samples_[i];
-            frame_total += benchmark_frame_samples_[i];
-            overlay_total += benchmark_overlay_samples_[i];
-        }
-        std::sort(frame_sorted, frame_sorted + benchmark_sample_count_);
-        std::sort(overlay_sorted, overlay_sorted + benchmark_sample_count_);
-
-        const float frame_average = frame_total / static_cast<float>(benchmark_sample_count_);
-        const float overlay_average = overlay_total / static_cast<float>(benchmark_sample_count_);
-        const int p95 = benchmark_percentile_index(benchmark_sample_count_, 0.95f);
-        const int p99 = benchmark_percentile_index(benchmark_sample_count_, 0.99f);
-        const float sample_scale = 1.0f / static_cast<float>(benchmark_sample_count_);
-
-        FILE* file = std::fopen(benchmark_path_, "wb");
-        if (!file) {
-            return;
-        }
-
-        std::fprintf(file,
-            "{\"lines\":%d,\"samples\":%d,\"fps\":%.3f,"
-            "\"frame_avg_ms\":%.3f,\"frame_p95_ms\":%.3f,\"frame_p99_ms\":%.3f,\"frame_max_ms\":%.3f,"
-            "\"overlay_avg_ms\":%.3f,\"overlay_p95_ms\":%.3f,\"overlay_p99_ms\":%.3f,\"overlay_max_ms\":%.3f,"
-            "\"projections_per_frame\":%.3f,\"draw_calls_per_frame\":%.3f,\"state_reads_per_frame\":%.3f}\n",
-            benchmark_line_count_, benchmark_sample_count_, frame_average > 0.0f ? 1000.0f / frame_average : 0.0f,
-            frame_average, frame_sorted[p95], frame_sorted[p99], frame_sorted[benchmark_sample_count_ - 1],
-            overlay_average, overlay_sorted[p95], overlay_sorted[p99], overlay_sorted[benchmark_sample_count_ - 1],
-            static_cast<float>(benchmark_projection_total_) * sample_scale,
-            static_cast<float>(benchmark_draw_call_total_) * sample_scale,
-            static_cast<float>(benchmark_state_read_total_) * sample_scale);
-        std::fclose(file);
-    }
-
-    void record_benchmark_sample(float frame_ms, float overlay_ms) {
-        const DWORD now_ms = GetTickCount();
-        if (benchmark_skip_next_sample_) {
-            benchmark_skip_next_sample_ = false;
-            return;
-        }
-        if (frame_ms <= 0.0f || overlay_ms < 0.0f) {
-            return;
-        }
-
-        if (benchmark_sample_count_ >= benchmark_max_samples_) {
-            write_benchmark_report();
-            reset_benchmark_samples(now_ms);
-        }
-
-        benchmark_frame_samples_[benchmark_sample_count_] = frame_ms;
-        benchmark_overlay_samples_[benchmark_sample_count_] = overlay_ms;
-        ++benchmark_sample_count_;
-        benchmark_projection_total_ += benchmark_current_projections_;
-        benchmark_draw_call_total_ += benchmark_current_draw_calls_;
-        benchmark_state_read_total_ += benchmark_current_state_reads_;
-
-        if (benchmark_sample_count_ >= 30 && now_ms - benchmark_last_report_ms_ >= 2000) {
-            write_benchmark_report();
-            reset_benchmark_samples(now_ms);
-            benchmark_skip_next_sample_ = true;
-        }
-    }
-
     int read_lines(LineState* lines, int max_lines) {
         if (!state_file_may_have_changed()) {
             return copy_cached_lines(lines, max_lines);
@@ -2062,7 +1925,6 @@ private:
         WIN32_FILE_ATTRIBUTE_DATA attributes_before {};
         if (!GetFileAttributesExA(state_path_, GetFileExInfoStandard, &attributes_before)) {
             state_cache_valid_ = false;
-            set_benchmark_state(false, 0);
             return 0;
         }
 
@@ -2084,7 +1946,6 @@ private:
             return state_cache_valid_ ? copy_cached_lines(lines, max_lines) : 0;
         }
 
-        ++benchmark_current_state_reads_;
         char buffer[131072] {};
         const std::size_t read = std::fread(buffer, 1, sizeof(buffer) - 1, file);
         std::fclose(file);
@@ -2099,13 +1960,6 @@ private:
             || buffer[content_end - 1] != '}') {
             return state_cache_valid_ ? copy_cached_lines(lines, max_lines) : 0;
         }
-
-        const char* benchmark = std::strstr(buffer, "\"benchmark\"");
-        const bool benchmark_enabled = benchmark && parse_json_bool(benchmark, "\"enabled\"");
-        const int benchmark_lines = benchmark
-            ? static_cast<int>(parse_json_uint(benchmark, "\"lines\""))
-            : 0;
-        set_benchmark_state(benchmark_enabled, benchmark_lines);
 
         const bool has_lines = std::strstr(buffer, "\"source\"") != nullptr;
 
@@ -2136,7 +1990,7 @@ private:
 
         LineState parsed_lines[128] {};
         int count = 0;
-        const int render_limit = benchmark_enabled_ ? max_lines : std::min(max_lines, 16);
+        const int render_limit = std::min(max_lines, 16);
         const char* lines_array = has_lines ? std::strstr(buffer, "\"lines\"") : nullptr;
         if (lines_array) {
             count = parse_line_array(lines_array, parsed_lines, render_limit);
@@ -2382,9 +2236,6 @@ private:
     }
 
     bool live_world_to_screen(float lua_x, float lua_y, float lua_z, const D3DVIEWPORT8& viewport, float& screen_x, float& screen_y) {
-        if (benchmark_enabled_) {
-            ++benchmark_current_projections_;
-        }
         if (!projection_matrices_valid_) {
             return false;
         }
@@ -2599,10 +2450,6 @@ private:
     }
 
     void submit_vertices(D3DPRIMITIVETYPE primitive_type, UINT primitive_count, const DrawVertex* vertices, UINT stride) {
-        if (benchmark_enabled_) {
-            ++benchmark_current_draw_calls_;
-        }
-
         const bool owns_draw_state = !draw_state_active_;
         if (owns_draw_state && !begin_draw_state()) {
             return;
@@ -2634,7 +2481,6 @@ private:
         CreateDirectoryA(settings_root, nullptr);
         std::snprintf(log_path_, sizeof(log_path_), "%s\\settings\\TargetLines\\native.log", module_path);
         std::snprintf(state_path_, sizeof(state_path_), "%s\\settings\\TargetLines\\lines.json", module_path);
-        std::snprintf(benchmark_path_, sizeof(benchmark_path_), "%s\\settings\\TargetLines\\benchmark.json", module_path);
         state_change_notification_ = FindFirstChangeNotificationA(
             settings_root,
             FALSE,
@@ -2672,9 +2518,6 @@ private:
     }
 
     int count_lines() {
-        if (benchmark_enabled_) {
-            ++benchmark_current_state_reads_;
-        }
         FILE* file = std::fopen(state_path_, "rb");
         if (!file) {
             return -static_cast<int>(errno);
@@ -2703,7 +2546,6 @@ private:
     }
     char state_path_[1024] {};
     char log_path_[1024] {};
-    char benchmark_path_[1024] {};
     HANDLE state_change_notification_ = INVALID_HANDLE_VALUE;
     unsigned long postrender_calls_ = 0;
     IDirect3DDevice8* d3d_device_ = nullptr;
@@ -2734,22 +2576,6 @@ private:
     float width_scale_ = 1.0f;
     float glow_scale_ = 1.0f;
     int dynamic_bone_ = 21;
-    static constexpr int benchmark_max_samples_ = 1024;
-    LARGE_INTEGER performance_frequency_ {};
-    LONGLONG previous_postrender_counter_ = 0;
-    bool benchmark_enabled_ = false;
-    bool benchmark_skip_next_sample_ = false;
-    int benchmark_line_count_ = 0;
-    int benchmark_sample_count_ = 0;
-    DWORD benchmark_last_report_ms_ = 0;
-    float benchmark_frame_samples_[benchmark_max_samples_] {};
-    float benchmark_overlay_samples_[benchmark_max_samples_] {};
-    unsigned long long benchmark_projection_total_ = 0;
-    unsigned long long benchmark_draw_call_total_ = 0;
-    unsigned long long benchmark_state_read_total_ = 0;
-    unsigned int benchmark_current_projections_ = 0;
-    unsigned int benchmark_current_draw_calls_ = 0;
-    unsigned int benchmark_current_state_reads_ = 0;
     LineState cached_lines_[128] {};
     int cached_line_count_ = 0;
     unsigned long long cached_state_write_time_ = 0;

@@ -179,9 +179,6 @@ The settings panel includes:
 > - `Line Duration` _// how long action lines remain visible_
 > - `AoE Fan Opacity` _// opacity for area-action fan-out lines_
 > - `Regular Attacks` _// first hit, delayed repeats, or off_
-> - `Benchmark Lines` _// temporary synthetic fan-line load test; off by default_
-
-<img width="682" height="516" alt="tlw-settings" src="https://github.com/user-attachments/assets/311bcbe3-7a18-4a1e-84c9-1515d1a37d4a" />
 
 `Enable Lines` is the master display toggle. The individual line toggles keep
 their saved values while the master toggle is off.
@@ -216,8 +213,6 @@ additional commands, including debug commands.
 //tl status                     Print status and write status to runtime log.
 //tl inspect                    Write an inspect snapshot to inspect.log.
 //tl autoinspect [on|off]       Periodically write inspect snapshots when enemies are nearby.
-//tl benchmark off|0|1|4|8|12|16|24|32|48|64|96|128 Draw synthetic fan lines.
-//tl benchmark report          Print the latest native benchmark window.
 ```
 
 ### Advanced/debug commands
@@ -247,14 +242,6 @@ disabled by default because it can be noisy.
 `//tl autoinspect on` writes inspect snapshots when enemies are nearby, first
 after zoning and then periodically. Snapshots record model and anchor data for
 review; they do not change behavior automatically.
-
-The temporary benchmark replaces live action lines while enabled and exercises
-the production state, animation, projection, and rendering paths. Native results
-are calculated over two-second windows and appear in the open settings panel.
-They include FPS, frame and overlay averages, p95/p99 timings, projections, draw
-calls, and state-file reads. Start with `Baseline (0)`, then increase the line
-count under similar camera and scene conditions. Disable the benchmark after
-testing to restore live action lines.
 
 </details>
 

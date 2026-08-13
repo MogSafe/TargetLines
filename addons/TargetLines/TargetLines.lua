@@ -1,6 +1,6 @@
 _addon.name = 'TargetLines'
 _addon.author = 'MogSafe'
-_addon.version = '1.0.3'
+_addon.version = '1.0.4'
 _addon.commands = {'targetlines', 'tl'}
 
 config = require('config')
@@ -41,7 +41,6 @@ defaults.claim_fallback = false
 defaults.claim_timeout = 0.5
 defaults.auto_inspect = false
 defaults.auto_inspect_interval = 120
-defaults.benchmark_lines = -1
 defaults.display = {}
 defaults.display.pos = {x = 160, y = 220}
 defaults.display.bg = {red = 0, green = 0, blue = 0, alpha = 150}
@@ -66,10 +65,7 @@ end
 if settings.regular_attack_mode ~= 'first' and settings.regular_attack_mode ~= 'repeat' and settings.regular_attack_mode ~= 'off' then
     settings.regular_attack_mode = settings.regular_attack_once == false and 'repeat' or defaults.regular_attack_mode
 end
-local valid_benchmark_counts = {[-1] = true, [0] = true, [1] = true, [4] = true, [8] = true, [12] = true, [16] = true, [24] = true, [32] = true, [48] = true, [64] = true, [96] = true, [128] = true}
-if not valid_benchmark_counts[tonumber(settings.benchmark_lines)] then
-    settings.benchmark_lines = defaults.benchmark_lines
-end
+settings.benchmark_lines = nil
 for _, opacity_key in ipairs({'player_opacity_scale', 'ally_opacity_scale', 'enemy_opacity_scale'}) do
     local saved_opacity = tonumber(settings[opacity_key])
     if saved_opacity == 1.0 then
@@ -97,7 +93,6 @@ local config_visible = false
 
 local state_dir = windower.windower_path .. 'plugins/settings/TargetLines'
 local state_path = state_dir .. '/lines.json'
-local benchmark_stats_path = state_dir .. '/benchmark.json'
 local inspect_path = windower.addon_path .. 'inspect.log'
 local runtime_log_path = windower.addon_path .. 'runtime.log'
 local last_write = 0
@@ -105,11 +100,7 @@ local last_signature = ''
 local last_state_maintenance = 0
 local state_maintenance_interval = 0.25
 local next_line_expiration = 0
-local last_benchmark_input_signature = nil
-local benchmark_reference_source = nil
 local last_boneprobe_active = false
-local last_benchmark_stats_read = 0
-local benchmark_stats = nil
 local last_lines = {}
 local last_nearby = {}
 local recent_lines = {}
@@ -206,21 +197,6 @@ local preset_rows = {
         {'Repeat After Delay', 'repeat'},
         {'Off', 'off'},
     },
-    benchmark_lines = {
-        {'Off', -1},
-        {'Baseline (0)', 0},
-        {'1 Line', 1},
-        {'4 Lines', 4},
-        {'8 Lines', 8},
-        {'12 Lines', 12},
-        {'16 Lines', 16},
-        {'24 Lines', 24},
-        {'32 Lines', 32},
-        {'48 Lines', 48},
-        {'64 Lines', 64},
-        {'96 Lines', 96},
-        {'128 Lines', 128},
-    },
 }
 
 local config_rows = {
@@ -242,7 +218,6 @@ local config_rows = {
     {type = 'choice', name = 'fade_scale', label = 'Line Duration'},
     {type = 'choice', name = 'fan_opacity_scale', label = 'AoE Fan Opacity'},
     {type = 'choice', name = 'regular_attack_mode', label = 'Regular Attacks'},
-    {type = 'choice', name = 'benchmark_lines', label = 'Benchmark Lines'},
 }
 
 local function clamp(value, minimum, maximum)
@@ -265,15 +240,6 @@ local function regular_mode()
     end
 
     return settings.regular_attack_once == false and 'repeat' or 'first'
-end
-
-local function benchmark_line_count()
-    local count = tonumber(settings.benchmark_lines)
-    return valid_benchmark_counts[count] and count or -1
-end
-
-local function benchmark_enabled()
-    return benchmark_line_count() >= 0
 end
 
 local function slider_bar(name)
@@ -409,8 +375,6 @@ local function set_preset(name, direction)
     if name == 'regular_attack_mode' then
         settings.regular_attack_once = settings.regular_attack_mode ~= 'repeat'
         seen_pairs = {}
-    elseif name == 'benchmark_lines' then
-        benchmark_stats = nil
     end
 
     config.save(settings)
@@ -1477,46 +1441,6 @@ local function collect_lines()
     return lines, nearby, next_expiration
 end
 
-local function collect_benchmark_lines(count, source, generation)
-    source = source or player_point(windower.ffxi.get_player())
-    local colors = active_colors()
-    local color = scale_color_alpha(colors.player, tonumber(settings.fan_opacity_scale) or defaults.fan_opacity_scale)
-    local lines = {}
-    local full_circle = math.pi * 2
-    generation = generation or (math.floor(os.clock() / 5) % 100000)
-
-    for index = 1, count do
-        local angle = full_circle * (index - 1) / math.max(count, 1)
-        local radius = 6.0 + ((index - 1) % 3) * 1.25
-        local target = {
-            id = 0x7F000000 + index,
-            index = 0,
-            name = 'Benchmark ' .. tostring(index),
-            x = (tonumber(source.x) or 0) + math.cos(angle) * radius,
-            y = (tonumber(source.y) or 0) + math.sin(angle) * radius,
-            z = tonumber(source.z) or 0,
-            hpp = 100,
-            facing = 0,
-            is_npc = false,
-            race = 0,
-            model = 0,
-            model_size = 0,
-            model_scale = 1,
-        }
-        lines[index] = {
-            uid = 0xB0000000 + generation * 256 + index,
-            source = source,
-            target = target,
-            kind = 'benchmark_fan',
-            color = color,
-            created = 0,
-            timeout = 10,
-        }
-    end
-
-    return lines
-end
-
 local function point_json(mob)
     return ('{"id":%u,"index":%u,"name":%s,"x":%.4f,"y":%.4f,"z":%.4f,"hpp":%u,"facing":%.6f,"npc":%s,"race":%u,"model":%u,"model_size":%.3f,"model_scale":%.3f,"short_anchor":%s,"floating_anchor":%s}')
         :format(tonumber(mob.id) or 0, tonumber(mob.index) or 0, json_string(mob.name),
@@ -1527,61 +1451,6 @@ local function point_json(mob)
             tonumber(mob.model_size) or 0, tonumber(mob.model_scale) or 1,
             short_anchor(mob) and 'true' or 'false',
             floating_anchor(mob) and 'true' or 'false')
-end
-
-local function benchmark_stat_number(contents, name)
-    local value = contents and contents:match('"' .. name .. '"%s*:%s*([%+%-]?[%d%.]+)')
-    return tonumber(value)
-end
-
-local function read_benchmark_stats(force)
-    local now = os.clock()
-    if not force and now - last_benchmark_stats_read < 0.25 then
-        return benchmark_stats
-    end
-    last_benchmark_stats_read = now
-
-    local file = io.open(benchmark_stats_path, 'r')
-    if not file then
-        return benchmark_stats
-    end
-
-    local contents = file:read('*a')
-    file:close()
-    local lines = benchmark_stat_number(contents, 'lines')
-    local samples = benchmark_stat_number(contents, 'samples')
-    if not lines or not samples then
-        return benchmark_stats
-    end
-
-    benchmark_stats = {
-        lines = lines,
-        samples = samples,
-        fps = benchmark_stat_number(contents, 'fps'),
-        frame_avg_ms = benchmark_stat_number(contents, 'frame_avg_ms'),
-        frame_p95_ms = benchmark_stat_number(contents, 'frame_p95_ms'),
-        frame_p99_ms = benchmark_stat_number(contents, 'frame_p99_ms'),
-        frame_max_ms = benchmark_stat_number(contents, 'frame_max_ms'),
-        overlay_avg_ms = benchmark_stat_number(contents, 'overlay_avg_ms'),
-        overlay_p95_ms = benchmark_stat_number(contents, 'overlay_p95_ms'),
-        overlay_p99_ms = benchmark_stat_number(contents, 'overlay_p99_ms'),
-        overlay_max_ms = benchmark_stat_number(contents, 'overlay_max_ms'),
-        projections_per_frame = benchmark_stat_number(contents, 'projections_per_frame'),
-        draw_calls_per_frame = benchmark_stat_number(contents, 'draw_calls_per_frame'),
-        state_reads_per_frame = benchmark_stat_number(contents, 'state_reads_per_frame'),
-    }
-    return benchmark_stats
-end
-
-local function benchmark_summary(stats)
-    if not stats then
-        return 'collecting native samples'
-    end
-
-    return ('%u lines | %.1f FPS | frame %.2f ms (p99 %.2f) | overlay %.2f ms (p99 %.2f)')
-        :format(tonumber(stats.lines) or 0, tonumber(stats.fps) or 0,
-            tonumber(stats.frame_avg_ms) or 0, tonumber(stats.frame_p99_ms) or 0,
-            tonumber(stats.overlay_avg_ms) or 0, tonumber(stats.overlay_p99_ms) or 0)
 end
 
 update_config_box = function()
@@ -1612,23 +1481,6 @@ update_config_box = function()
     rows[#rows + 1] = ''
     rows[#rows + 1] = 'Click [<] [>] or [ON/OFF]'
 
-    local benchmark_count = benchmark_line_count()
-    if benchmark_count >= 0 then
-        local stats = read_benchmark_stats(false)
-        if stats and tonumber(stats.lines) ~= benchmark_count then
-            stats = nil
-        end
-        rows[#rows + 1] = ''
-        rows[#rows + 1] = color_text('BENCHMARK ACTIVE - live action lines are hidden', 255, 205, 90)
-        rows[#rows + 1] = benchmark_summary(stats)
-        if stats then
-            rows[#rows + 1] = ('p95 overlay %.2f ms | max %.2f ms | projections %.0f | draws %.0f | reads %.1f')
-                :format(tonumber(stats.overlay_p95_ms) or 0, tonumber(stats.overlay_max_ms) or 0,
-                    tonumber(stats.projections_per_frame) or 0, tonumber(stats.draw_calls_per_frame) or 0,
-                    tonumber(stats.state_reads_per_frame) or 0)
-        end
-    end
-
     config_box.current_string = table.concat(rows, '\n')
     config_box:show()
 end
@@ -1646,15 +1498,12 @@ local function encode_state(lines)
             effective_source_height(),
             effective_target_height()),
         ',',
-        ('"benchmark":{"enabled":%s,"lines":%u}'):format(
-            benchmark_enabled() and 'true' or 'false', math.max(benchmark_line_count(), 0)),
-        ',',
         ('"boneprobe":%s'):format(os.clock() < boneprobe_until and 'true' or 'false'),
         ',',
         '"lines":[',
     }
 
-    local serialized_line_limit = benchmark_enabled() and 128 or 16
+    local serialized_line_limit = 16
     for index, line in ipairs(lines) do
         if index > serialized_line_limit then
             break
@@ -1672,8 +1521,7 @@ local function encode_state(lines)
 
     parts[#parts + 1] = ']'
     parts[#parts + 1] = ',"probe_lines":['
-    local encoded_probe_lines = benchmark_enabled() and {} or probe_lines
-    for index, line in ipairs(encoded_probe_lines) do
+    for index, line in ipairs(probe_lines) do
         if index > 1 then
             parts[#parts + 1] = ','
         end
@@ -1747,25 +1595,9 @@ windower.register_event('prerender', function()
     end
 
     last_write = now
-    local benchmark_count = benchmark_line_count()
-    local benchmark_source = nil
-    local benchmark_generation = nil
-    local benchmark_input_signature = nil
-    if benchmark_count >= 0 then
-        benchmark_generation = math.floor(now / 5) % 100000
-        benchmark_input_signature = ('%u:%u'):format(benchmark_count, benchmark_generation)
-        if benchmark_input_signature ~= last_benchmark_input_signature or not benchmark_reference_source then
-            benchmark_reference_source = player_point(windower.ffxi.get_player())
-        end
-        benchmark_source = benchmark_reference_source
-    else
-        benchmark_reference_source = nil
-    end
-
     local boneprobe_active = now < boneprobe_until
     local state_invalidated = last_signature == ''
         or boneprobe_active ~= last_boneprobe_active
-        or benchmark_input_signature ~= last_benchmark_input_signature
     local expiration_due = next_line_expiration > 0 and now >= next_line_expiration
     local maintenance_due = now - last_state_maintenance >= state_maintenance_interval
     local rebuild_state = state_invalidated or expiration_due or maintenance_due or settings.claim_fallback == true
@@ -1775,14 +1607,10 @@ windower.register_event('prerender', function()
         last_state_maintenance = now
         next_line_expiration = expiration
         last_nearby = nearby
-        if benchmark_count >= 0 then
-            lines = collect_benchmark_lines(benchmark_count, benchmark_source, benchmark_generation)
-        end
         last_lines = lines
         write_state(lines)
     end
 
-    last_benchmark_input_signature = benchmark_input_signature
     last_boneprobe_active = boneprobe_active
     update_auto_inspect(last_nearby)
     update_debug(last_lines)
@@ -1803,12 +1631,6 @@ windower.register_event('addon command', function(command, ...)
         config.save(settings)
         log('TargetLines enabled.')
     elseif command == 'off' then
-        if benchmark_enabled() then
-            settings.benchmark_lines = -1
-            benchmark_stats = nil
-            last_signature = ''
-            write_state({})
-        end
         settings.enabled = false
         config.save(settings)
         box:hide()
@@ -1850,42 +1672,6 @@ windower.register_event('addon command', function(command, ...)
         config_visible = not config_visible
         update_config_box()
         log('TargetLines config ' .. (config_visible and 'shown.' or 'hidden.'))
-    elseif command == 'benchmark' or command == 'bench' then
-        local value = args[1] and args[1]:lower() or nil
-        if value == 'report' or value == 'status' then
-            if not benchmark_enabled() then
-                log('TargetLines benchmark is disabled.')
-                return
-            end
-            local stats = read_benchmark_stats(true)
-            if not stats or tonumber(stats.lines) ~= benchmark_line_count() then
-                log('TargetLines benchmark is still collecting native samples.')
-            else
-                log('TargetLines benchmark: ' .. benchmark_summary(stats))
-                log(('TargetLines benchmark work/frame: p95 overlay %.2f ms, max %.2f ms, projections %.0f, draw calls %.0f, state reads %.1f.')
-                    :format(tonumber(stats.overlay_p95_ms) or 0, tonumber(stats.overlay_max_ms) or 0,
-                        tonumber(stats.projections_per_frame) or 0, tonumber(stats.draw_calls_per_frame) or 0,
-                        tonumber(stats.state_reads_per_frame) or 0))
-            end
-            return
-        end
-
-        local count = value == 'off' and -1 or tonumber(value)
-        if not valid_benchmark_counts[count] then
-            warning('Usage: //tl benchmark off|0|1|4|8|12|16|24|32|48|64|96|128|report')
-            return
-        end
-
-        settings.benchmark_lines = count
-        benchmark_stats = nil
-        last_signature = ''
-        config.save(settings)
-        update_config_box()
-        if count >= 0 then
-            log(('TargetLines benchmark enabled with %u synthetic lines. Live action lines are temporarily hidden.'):format(count))
-        else
-            log('TargetLines benchmark disabled. Live action lines restored.')
-        end
     elseif command == 'playerlines' or command == 'player' then
         log('TargetLines player lines ' .. (set_boolean_from_arg('show_player_lines', args[1]) and 'enabled.' or 'disabled.'))
     elseif command == 'partylines' or command == 'party' or command == 'trustlines' or command == 'trusts' then
@@ -2184,7 +1970,7 @@ windower.register_event('addon command', function(command, ...)
         append_runtime_log('native command forwarded via addon alias: ' .. native_command)
         log('TargetLines native command forwarded: ' .. native_command)
     else
-        log('Commands: //tl on | off | config | settings | benchmark off|0|1|4|8|12|16|24|32|48|64|96|128|report | playerlines [on|off] | partylines [on|off] | petlines [on|off] | enemylines [on|off] | otherpartylines [on|off] | speciallines [on|off] | fanlines [on|off] | colorblind [on|off] | regular first|repeat|off | playeropacity +/- | allyopacity +/- | enemyopacity +/- | opacity +/- | fade +/- | width +/- | glow +/- | fanopacity +/- | debug [on|off] | actiondebug [on|off] | sourceheight +/- | targetheight +/- | timeout <sec> | range <yalms> | interval <sec> | cooldown <sec> | specialcooldown <sec> | claim [on|off] | autoinspect [on|off] | autoinspect interval <sec> | boneprobe | luamobprobe | dynamicbone <auto|off|0-255> | clear | status | inspect')
+        log('Commands: //tl on | off | config | settings | playerlines [on|off] | partylines [on|off] | petlines [on|off] | enemylines [on|off] | otherpartylines [on|off] | speciallines [on|off] | fanlines [on|off] | colorblind [on|off] | regular first|repeat|off | playeropacity +/- | allyopacity +/- | enemyopacity +/- | opacity +/- | fade +/- | width +/- | glow +/- | fanopacity +/- | debug [on|off] | actiondebug [on|off] | sourceheight +/- | targetheight +/- | timeout <sec> | range <yalms> | interval <sec> | cooldown <sec> | specialcooldown <sec> | claim [on|off] | autoinspect [on|off] | autoinspect interval <sec> | boneprobe | luamobprobe | dynamicbone <auto|off|0-255> | clear | status | inspect')
     end
 end)
 
@@ -2193,13 +1979,6 @@ windower.register_event('mouse', function(type, x, y, delta, blocked)
 end)
 
 windower.register_event('unload', function()
-    if benchmark_enabled() then
-        settings.benchmark_lines = -1
-        benchmark_stats = nil
-        config.save(settings)
-        last_signature = ''
-        write_state({})
-    end
     box:hide()
     config_box:hide()
 end)
