@@ -5,6 +5,7 @@
 #include <d3d8.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cmath>
 #include <ctime>
@@ -12,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <vector>
 
 namespace {
 HMODULE g_module = nullptr;
@@ -88,6 +90,9 @@ public:
     }
 
     void __stdcall Unload() override {
+#if defined(TARGETLINES_DIAGNOSTIC_BONE_SCAN)
+        stop_diagnostic_bone_probe();
+#endif
         append_log("unloaded");
         close_state_change_notification();
     }
@@ -299,7 +304,8 @@ private:
         }
 
         char message[256] {};
-        std::snprintf(message, sizeof(message), "device probe reason=%s manager=%p device=%p", reason ? reason : "unknown", plugin_manager_, device);
+        std::snprintf(message, sizeof(message), "device probe reason=%s manager=%p device=%p", reason ? reason : "unknown",
+            static_cast<void*>(plugin_manager_), static_cast<void*>(device));
         append_log(message);
         d3d_device_ = static_cast<IDirect3DDevice8*>(device);
     }
@@ -370,7 +376,8 @@ private:
 
         FFXI* ffxi = plugin_manager_ ? plugin_manager_->GetFFXI() : nullptr;
         char header[256] {};
-        std::snprintf(header, sizeof(header), "ffxiprobe manager=%p ffxi=%p", plugin_manager_, ffxi);
+        std::snprintf(header, sizeof(header), "ffxiprobe manager=%p ffxi=%p",
+            static_cast<void*>(plugin_manager_), static_cast<void*>(ffxi));
         append_log(header);
         if (!ffxi) {
             return;
@@ -471,17 +478,17 @@ private:
         }
 
         std::uintptr_t mob_array = 0;
-        std::uintptr_t lua_base = 0;
-        std::uintptr_t context = 0;
-        if (!get_luacore_mob_array(mob_array, &lua_base, &context)) {
-            append_log("luamobprobe LuaCore.dll not loaded");
+        std::uintptr_t module_base = 0;
+        std::uintptr_t signature = 0;
+        if (!get_luacore_mob_array(mob_array, &module_base, &signature)) {
+            append_log("luamobprobe mob array unavailable");
             return;
         }
 
         char message[256] {};
-        std::snprintf(message, sizeof(message), "luamobprobe base=%08lx context=%08lx mob_array=%08lx",
-            static_cast<unsigned long>(lua_base),
-            static_cast<unsigned long>(context),
+        std::snprintf(message, sizeof(message), "luamobprobe ffxi_base=%08lx signature=%08lx mob_array=%08lx",
+            static_cast<unsigned long>(module_base),
+            static_cast<unsigned long>(signature),
             static_cast<unsigned long>(mob_array));
         append_log(message);
 
@@ -655,7 +662,32 @@ private:
     }
 
     void probe_actor_bones(const char* label, std::uintptr_t actor, int max_bones) {
-        for (int bone = 0; bone < max_bones; ++bone) {
+        std::uint32_t skeleton_base = 0;
+        std::uint32_t skeleton_offset = 0;
+        std::uint32_t skeleton = 0;
+        std::uint16_t bone_count = 0;
+        if (!read_memory(actor + 0x6B8, skeleton_base) ||
+            !read_memory(static_cast<std::uintptr_t>(skeleton_base) + 0x0C, skeleton_offset) ||
+            !read_memory(static_cast<std::uintptr_t>(skeleton_offset), skeleton) ||
+            !read_memory(static_cast<std::uintptr_t>(skeleton) + 0x32, bone_count) ||
+            bone_count == 0 || bone_count > 256) {
+            char message[256] {};
+            std::snprintf(message, sizeof(message),
+                "boneprobe %s bone_enumeration_failed actor=%08lx bone_count=%u",
+                label ? label : "unknown", static_cast<unsigned long>(actor), bone_count);
+            append_log(message);
+            return;
+        }
+
+        const int sample_count = std::min(max_bones, static_cast<int>(bone_count));
+        char header[256] {};
+        std::snprintf(header, sizeof(header),
+            "boneprobe %s bone_enumeration_begin actor=%08lx bone_count=%u samples=%d",
+            label ? label : "unknown", static_cast<unsigned long>(actor), bone_count, sample_count);
+        append_log(header);
+
+        int logged = 0;
+        for (int bone = 0; bone < sample_count; ++bone) {
             float bone_x = 0.0f;
             float bone_y = 0.0f;
             float bone_z = 0.0f;
@@ -672,7 +704,14 @@ private:
                 bone_x, bone_y, bone_z,
                 detail);
             append_log(message);
+            ++logged;
         }
+
+        char summary[256] {};
+        std::snprintf(summary, sizeof(summary),
+            "boneprobe %s bone_enumeration_complete actor=%08lx logged=%d",
+            label ? label : "unknown", static_cast<unsigned long>(actor), logged);
+        append_log(summary);
     }
 
     void probe_actor_roots_near_pointer(const char* label, std::uintptr_t pointer, float lua_x, float lua_y, float lua_z) {
@@ -784,6 +823,10 @@ private:
         DWORD target_id = 0;
         DWORD source_index = 0;
         DWORD target_index = 0;
+        DWORD source_race = 0;
+        DWORD target_race = 0;
+        DWORD source_model = 0;
+        DWORD target_model = 0;
         float source_x = 0.0f;
         float source_y = 0.0f;
         float source_z = 0.0f;
@@ -807,6 +850,8 @@ private:
     struct RingTargetState {
         DWORD id = 0;
         DWORD index = 0;
+        DWORD race = 0;
+        DWORD model = 0;
         float x = 0.0f;
         float y = 0.0f;
         float z = 0.0f;
@@ -1009,9 +1054,9 @@ private:
         float p2_y = line.target_y;
         float p2_z = line.target_z + target_height;
         resolve_live_anchor_cached(mob_array, line.source_is_npc, line.source_index,
-            dynamic_bone_, source_height, p0_x, p0_y, p0_z);
+            anchor_bone_for_entity(line.source_race, line.source_model, line.source_is_npc), source_height, p0_x, p0_y, p0_z);
         resolve_live_anchor_cached(mob_array, line.target_is_npc, line.target_index,
-            dynamic_bone_, target_height, p2_x, p2_y, p2_z);
+            anchor_bone_for_entity(line.target_race, line.target_model, line.target_is_npc), target_height, p2_x, p2_y, p2_z);
         if (spread_source) {
             apply_source_spread(line, p0_x, p0_y);
         }
@@ -1212,8 +1257,10 @@ private:
         const float center_height = model_adjusted_height(source_height_offset_, ring.center_model_size,
             ring.center_model_scale, ring.center_short_anchor, ring.center_floating_anchor, ring.center_is_npc);
         float center_z = ring.center_z + center_height;
-        resolve_live_anchor_cached(mob_array, ring.center_is_npc, ring.center_index,
-            dynamic_bone_, center_height, center_x, center_y, center_z);
+        // Keep the AoE footprint at the action-time position. Impact markers
+        // still resolve their targets live below so they remain attached to
+        // affected entities while the stationary ring shows where the effect
+        // occurred.
 
         if (age <= timeout) {
             draw_projected_ring(viewport, center_x, center_y, center_z, ring.radius, haze_thickness, outer_haze_color);
@@ -1356,7 +1403,7 @@ private:
             target.short_anchor, target.floating_anchor, target.is_npc);
         float target_z = target.z + target_height;
         resolve_live_anchor_cached(mob_array, target.is_npc, target.index,
-            dynamic_bone_, target_height, target_x, target_y, target_z);
+            anchor_bone_for_entity(target.race, target.model, target.is_npc), target_height, target_x, target_y, target_z);
 
         const float target_scale = target.model_scale > 0.0f ? target.model_scale : 1.0f;
         const float effective_size = std::fmax(0.0f, target.model_size * target_scale);
@@ -1364,21 +1411,19 @@ private:
 
         const float dx = target_x - center_x;
         const float dy = target_y - center_y;
-        float distance_ratio = std::fmax(0.0f,
+        const float distance_ratio = std::fmax(0.0f,
             std::fmin(std::sqrt(dx * dx + dy * dy) / std::fmax(ring_radius, 0.1f), 1.0f));
+        float marker_age = 0.0f;
         if (center_target) {
-            // Do not start the center marker inside the expanding pulse. Treat it
-            // as though it were at the radius needed for the pulse to clear the
-            // complete marker, while preserving normal arrival timing elsewhere.
-            const float clearance_scale = indicator_style == 10 ? 1.75f : 1.35f;
-            const float clearance_ratio = std::fmax(0.0f,
-                std::fmin((halo_radius * clearance_scale) / std::fmax(ring_radius, 0.1f), 1.0f));
-            distance_ratio = std::fmax(distance_ratio, clearance_ratio);
+            // Play the center marker last so it does not compound visually with
+            // the inner pulse while that pulse is expanding from the same point.
+            marker_age = ring_age - pulse_duration;
+        } else {
+            constexpr float pulse_start_scale = 0.08f;
+            const float wave_ratio = std::fmax(0.0f, std::fmin((distance_ratio - pulse_start_scale) / (1.0f - pulse_start_scale), 1.0f));
+            const float arrival_t = 1.0f - std::pow(std::fmax(0.0f, 1.0f - wave_ratio), 2.0f / 3.0f);
+            marker_age = ring_age - pulse_duration * arrival_t;
         }
-        constexpr float pulse_start_scale = 0.08f;
-        const float wave_ratio = std::fmax(0.0f, std::fmin((distance_ratio - pulse_start_scale) / (1.0f - pulse_start_scale), 1.0f));
-        const float arrival_t = 1.0f - std::pow(std::fmax(0.0f, 1.0f - wave_ratio), 2.0f / 3.0f);
-        const float marker_age = ring_age - pulse_duration * arrival_t;
         if (marker_age < 0.0f || marker_age > ring_marker_duration_) {
             return;
         }
@@ -1550,6 +1595,23 @@ private:
         // In this coordinate mapping, more negative z offsets raise the screen anchor.
         const float auto_raise = std::fmin((effective_size - 1.2f) * 0.45f, 1.15f);
         return manual_offset - auto_raise;
+    }
+
+    int anchor_bone_for_entity(DWORD race, DWORD model, bool is_npc) const {
+        // Auto mode uses the visually verified torso bone for each humanoid
+        // skeleton. Mithra (race 7) maps bone 21 near the head; bone 39 is the
+        // centered upper-chest equivalent. A few unique trust models have the
+        // same visual mismatch despite reporting other race data. Explicit
+        // non-auto bone selections remain global diagnostic overrides.
+        const bool model_uses_bone_39 =
+            (race == 2 && model == 3033) || // Najelith
+            (race == 0 && model == 3041) || // Cid
+            (race == 2 && model == 3071);   // Margret
+        if (is_npc && dynamic_bone_ == 21 &&
+            (race == 7 || model_uses_bone_39)) {
+            return 39;
+        }
+        return dynamic_bone_;
     }
 
     bool resolve_live_anchor(std::uintptr_t mob_array, bool is_npc, DWORD index, int bone,
@@ -1845,9 +1907,59 @@ private:
             return;
         }
 
+#if defined(TARGETLINES_DIAGNOSTIC_BONE_SCAN)
+        start_diagnostic_bone_probe(lines[0].target_x, lines[0].target_y, lines[0].target_z);
+#else
         probe_actor_candidates("source", lines[0].source_id, lines[0].source_index, lines[0].source_x, lines[0].source_y, lines[0].source_z);
         probe_actor_candidates("target", lines[0].target_id, lines[0].target_index, lines[0].target_x, lines[0].target_y, lines[0].target_z);
+#endif
     }
+
+#if defined(TARGETLINES_DIAGNOSTIC_BONE_SCAN)
+    static DWORD WINAPI diagnostic_bone_probe_thread_entry(void* context) {
+        TargetLinesPlugin* self = static_cast<TargetLinesPlugin*>(context);
+        self->probe_actor_coordinate_scan("target", self->diagnostic_probe_x_, self->diagnostic_probe_y_, self->diagnostic_probe_z_);
+        self->diagnostic_bone_probe_running_.store(false);
+        return 0;
+    }
+
+    void start_diagnostic_bone_probe(float x, float y, float z) {
+        if (diagnostic_bone_probe_thread_ &&
+            WaitForSingleObject(diagnostic_bone_probe_thread_, 0) == WAIT_OBJECT_0) {
+            CloseHandle(diagnostic_bone_probe_thread_);
+            diagnostic_bone_probe_thread_ = nullptr;
+        }
+
+        if (diagnostic_bone_probe_running_.load()) {
+            append_log("boneprobe target diagnostic scan already running");
+            return;
+        }
+
+        diagnostic_probe_x_ = x;
+        diagnostic_probe_y_ = y;
+        diagnostic_probe_z_ = z;
+        diagnostic_bone_probe_cancel_.store(false);
+        diagnostic_bone_probe_running_.store(true);
+        diagnostic_bone_probe_thread_ = CreateThread(nullptr, 0, diagnostic_bone_probe_thread_entry, this, 0, nullptr);
+        if (!diagnostic_bone_probe_thread_) {
+            diagnostic_bone_probe_running_.store(false);
+            append_log("boneprobe target diagnostic thread creation failed");
+            return;
+        }
+
+        append_log("boneprobe target diagnostic scan started in background");
+    }
+
+    void stop_diagnostic_bone_probe() {
+        diagnostic_bone_probe_cancel_.store(true);
+        if (diagnostic_bone_probe_thread_) {
+            WaitForSingleObject(diagnostic_bone_probe_thread_, INFINITE);
+            CloseHandle(diagnostic_bone_probe_thread_);
+            diagnostic_bone_probe_thread_ = nullptr;
+        }
+        diagnostic_bone_probe_running_.store(false);
+    }
+#endif
 
     bool is_readable_page(DWORD protect) const {
         if (protect & (PAGE_GUARD | PAGE_NOACCESS)) {
@@ -1939,37 +2051,132 @@ private:
         return true;
     }
 
-    bool get_luacore_mob_array(std::uintptr_t& mob_array, std::uintptr_t* lua_base_out, std::uintptr_t* context_out) {
+    bool get_luacore_mob_array(std::uintptr_t& mob_array, std::uintptr_t* module_base_out, std::uintptr_t* signature_out) {
         mob_array = 0;
-        if (lua_base_out) {
-            *lua_base_out = 0;
+        if (module_base_out) {
+            *module_base_out = 0;
         }
-        if (context_out) {
-            *context_out = 0;
+        if (signature_out) {
+            *signature_out = 0;
         }
 
-        HMODULE lua_core = GetModuleHandleA("LuaCore.dll");
-        if (!lua_core) {
+        if (cached_mob_array_ != 0 &&
+            is_readable_range(cached_mob_array_, sizeof(std::uintptr_t) * 0x900)) {
+            mob_array = cached_mob_array_;
+            if (module_base_out) {
+                *module_base_out = cached_mob_array_module_base_;
+            }
+            if (signature_out) {
+                *signature_out = cached_mob_array_signature_;
+            }
+            return true;
+        }
+
+        cached_mob_array_ = 0;
+        const DWORD now_ms = GetTickCount();
+        if (now_ms < next_mob_array_resolve_ms_) {
+            return false;
+        }
+        next_mob_array_resolve_ms_ = now_ms + 5000;
+
+        HMODULE ffxi_main = GetModuleHandleA("FFXiMain.dll");
+        if (!ffxi_main) {
             return false;
         }
 
-        const std::uintptr_t lua_base = reinterpret_cast<std::uintptr_t>(lua_core);
-        const std::uintptr_t context_global = lua_base + 0x1c8400;
-        std::uintptr_t context = 0;
-        if (!read_memory(context_global, context) ||
-            !read_memory(context + 0x24, mob_array) ||
-            !is_readable_range(mob_array, sizeof(std::uintptr_t) * 0x900)) {
-            mob_array = 0;
+        const std::uintptr_t module_base = reinterpret_cast<std::uintptr_t>(ffxi_main);
+        IMAGE_DOS_HEADER dos {};
+        if (!read_memory(module_base, dos) || dos.e_magic != IMAGE_DOS_SIGNATURE) {
             return false;
         }
 
-        if (lua_base_out) {
-            *lua_base_out = lua_base;
+        IMAGE_NT_HEADERS32 nt {};
+        const std::uintptr_t nt_address = module_base + static_cast<std::uintptr_t>(dos.e_lfanew);
+        if (!read_memory(nt_address, nt) || nt.Signature != IMAGE_NT_SIGNATURE ||
+            nt.FileHeader.NumberOfSections == 0 || nt.FileHeader.NumberOfSections > 96) {
+            return false;
         }
-        if (context_out) {
-            *context_out = context;
+
+        // LuaCore uses this FFXiMain instruction sequence to resolve its mob
+        // pointer array: mov edx,[esi+0Ch]; mov eax,[edx+ebp]; mov eax,[eax*4+imm32].
+        // The relocated imm32 immediately following the signature is the array.
+        static constexpr unsigned char mob_array_signature[] = {
+            0x8B, 0x56, 0x0C, 0x8B, 0x04, 0x2A, 0x8B, 0x04, 0x85,
+        };
+
+        const std::uintptr_t section_table = nt_address +
+            sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER) + nt.FileHeader.SizeOfOptionalHeader;
+        for (WORD section_index = 0; section_index < nt.FileHeader.NumberOfSections; ++section_index) {
+            IMAGE_SECTION_HEADER section {};
+            const std::uintptr_t section_header = section_table +
+                static_cast<std::uintptr_t>(section_index) * sizeof(IMAGE_SECTION_HEADER);
+            if (!read_memory(section_header, section) ||
+                (section.Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) {
+                continue;
+            }
+
+            const std::size_t section_size = static_cast<std::size_t>(section.Misc.VirtualSize);
+            if (section_size < sizeof(mob_array_signature) + sizeof(std::uint32_t) ||
+                section_size > 0x2000000) {
+                continue;
+            }
+
+            const std::uintptr_t section_begin = module_base + section.VirtualAddress;
+            const std::uintptr_t section_end = section_begin + section_size;
+            std::uintptr_t region_address = section_begin;
+            while (region_address < section_end) {
+                MEMORY_BASIC_INFORMATION mbi {};
+                if (!VirtualQuery(reinterpret_cast<const void*>(region_address), &mbi, sizeof(mbi))) {
+                    break;
+                }
+
+                const std::uintptr_t region_begin = std::max(
+                    region_address, reinterpret_cast<std::uintptr_t>(mbi.BaseAddress));
+                const std::uintptr_t region_end = std::min(
+                    section_end, reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) +
+                        static_cast<std::uintptr_t>(mbi.RegionSize));
+                if (mbi.State == MEM_COMMIT && is_readable_page(mbi.Protect) &&
+                    region_end > region_begin + sizeof(mob_array_signature) + sizeof(std::uint32_t)) {
+                    const unsigned char* bytes = reinterpret_cast<const unsigned char*>(region_begin);
+                    const std::size_t region_size = static_cast<std::size_t>(region_end - region_begin);
+                    for (std::size_t offset = 0;
+                        offset + sizeof(mob_array_signature) + sizeof(std::uint32_t) <= region_size;
+                        ++offset) {
+                        if (std::memcmp(bytes + offset, mob_array_signature, sizeof(mob_array_signature)) != 0) {
+                            continue;
+                        }
+
+                        std::uint32_t candidate = 0;
+                        std::memcpy(&candidate, bytes + offset + sizeof(mob_array_signature), sizeof(candidate));
+                        const std::uintptr_t candidate_address = static_cast<std::uintptr_t>(candidate);
+                        if (!is_readable_range(candidate_address, sizeof(std::uintptr_t) * 0x900)) {
+                            continue;
+                        }
+
+                        mob_array = candidate_address;
+                        cached_mob_array_ = candidate_address;
+                        cached_mob_array_module_base_ = module_base;
+                        cached_mob_array_signature_ = region_begin + offset;
+                        if (module_base_out) {
+                            *module_base_out = module_base;
+                        }
+                        if (signature_out) {
+                            *signature_out = cached_mob_array_signature_;
+                        }
+                        append_log("mob array resolved from FFXiMain signature");
+                        return true;
+                    }
+                }
+
+                if (region_end <= region_address) {
+                    break;
+                }
+                region_address = region_end;
+            }
         }
-        return true;
+
+        append_log("mob array FFXiMain signature not found");
+        return false;
     }
 
     bool read_bone_anchor(std::uintptr_t actor, int bone, float& lua_x, float& lua_y, float& lua_z, char* detail, std::size_t detail_size) {
@@ -2064,9 +2271,18 @@ private:
         append_log(header);
 
         probe_actor_identity_near_roots(label, id, index, lua_x, lua_y, lua_z);
+#if defined(TARGETLINES_DIAGNOSTIC_BONE_SCAN)
+        if (label && std::strcmp(label, "target") == 0) {
+            append_log("boneprobe target diagnostic coordinate scan starting; rendering may pause briefly");
+            probe_actor_coordinate_scan(label, lua_x, lua_y, lua_z);
+        } else {
+            append_log("boneprobe source coordinate scan skipped in target-only diagnostic build");
+        }
+#else
         append_log(label && std::strcmp(label, "source") == 0
             ? "boneprobe source coordinate scan disabled: render-thread process scan is too expensive"
             : "boneprobe target coordinate scan disabled: render-thread process scan is too expensive");
+#endif
     }
 
     void probe_actor_coordinate_scan(const char* label, float lua_x, float lua_y, float lua_z) {
@@ -2074,6 +2290,8 @@ private:
         GetSystemInfo(&info);
         std::uintptr_t address = reinterpret_cast<std::uintptr_t>(info.lpMinimumApplicationAddress);
         const std::uintptr_t max_address = reinterpret_cast<std::uintptr_t>(info.lpMaximumApplicationAddress);
+        constexpr SIZE_T scan_chunk_size = 4 * 1024 * 1024;
+        std::vector<std::uint8_t> scan_buffer(scan_chunk_size + 8);
 
         int matches = 0;
         int logged = 0;
@@ -2081,76 +2299,103 @@ private:
         int regions = 0;
         unsigned long scanned_mb = 0;
         MEMORY_BASIC_INFORMATION mbi {};
-        while (bone_matches < 4 && address < max_address && VirtualQuery(reinterpret_cast<const void*>(address), &mbi, sizeof(mbi))) {
+        while (bone_matches < 1 && address < max_address &&
+#if defined(TARGETLINES_DIAGNOSTIC_BONE_SCAN)
+            !diagnostic_bone_probe_cancel_.load() &&
+#endif
+            VirtualQuery(reinterpret_cast<const void*>(address), &mbi, sizeof(mbi))) {
             const std::uintptr_t region_base = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress);
             std::uintptr_t region_end = region_base + mbi.RegionSize;
             if (region_end > max_address) {
                 region_end = max_address;
             }
-            if (mbi.State == MEM_COMMIT && is_readable_page(mbi.Protect) && mbi.RegionSize > 0x700) {
+            if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE &&
+                is_readable_page(mbi.Protect) && mbi.RegionSize > 0x700) {
                 ++regions;
                 scanned_mb += static_cast<unsigned long>(mbi.RegionSize / (1024 * 1024));
-                const std::uintptr_t scan_begin = region_base + 0x678;
-                const std::uintptr_t scan_end = region_end > 0x684 ? region_end - 0x684 : scan_begin;
-                for (std::uintptr_t pos = scan_begin; bone_matches < 4 && pos < scan_end; pos += sizeof(float)) {
-                    float value = 0.0f;
-                    if (!read_memory_raw(pos, value)) {
+                for (std::uintptr_t chunk_base = region_base;
+                    bone_matches < 1 && chunk_base < region_end
+#if defined(TARGETLINES_DIAGNOSTIC_BONE_SCAN)
+                        && !diagnostic_bone_probe_cancel_.load()
+#endif
+                    ;
+                    chunk_base += scan_chunk_size) {
+                    const SIZE_T remaining = static_cast<SIZE_T>(region_end - chunk_base);
+                    const SIZE_T bytes_requested = std::min(remaining, scan_chunk_size + 8);
+                    SIZE_T bytes_read = 0;
+                    if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(chunk_base),
+                            scan_buffer.data(), bytes_requested, &bytes_read) || bytes_read < 12) {
                         continue;
                     }
 
-                    if (std::fabs(value - lua_x) > 0.05f) {
-                        continue;
-                    }
+                    const std::uintptr_t scan_begin = std::max(chunk_base, region_base + 0x678);
+                    const SIZE_T first_offset = static_cast<SIZE_T>(scan_begin - chunk_base);
+                    for (SIZE_T offset = first_offset; bone_matches < 1 && offset + 12 <= bytes_read; offset += sizeof(float)) {
+#if defined(TARGETLINES_DIAGNOSTIC_BONE_SCAN)
+                        if ((offset & 0x3FFFF) == 0 && diagnostic_bone_probe_cancel_.load()) {
+                            break;
+                        }
+#endif
+                        float root_x = 0.0f;
+                        float root_z = 0.0f;
+                        float root_y = 0.0f;
+                        std::memcpy(&root_x, scan_buffer.data() + offset, sizeof(float));
+                        if (std::fabs(root_x - lua_x) > 0.05f) {
+                            continue;
+                        }
 
-                    const std::uintptr_t actor = pos - 0x678;
-                    float root_z = 0.0f;
-                    float root_y = 0.0f;
-                    if (!read_memory_raw(actor + 0x67C, root_z) || !read_memory_raw(actor + 0x680, root_y)) {
-                        continue;
-                    }
+                        std::memcpy(&root_z, scan_buffer.data() + offset + 4, sizeof(float));
+                        std::memcpy(&root_y, scan_buffer.data() + offset + 8, sizeof(float));
+                        if (std::fabs(root_z - lua_z) > 0.10f || std::fabs(root_y - lua_y) > 0.10f) {
+                            continue;
+                        }
 
-                    if (std::fabs(root_z - lua_z) > 0.10f || std::fabs(root_y - lua_y) > 0.10f) {
-                        continue;
-                    }
+                        const std::uintptr_t pos = chunk_base + offset;
+                        const std::uintptr_t actor = pos - 0x678;
+                        ++matches;
+                        std::uint32_t skeleton_base_probe = 0;
+                        if (!read_memory(actor + 0x6B8, skeleton_base_probe) || !is_readable_range(static_cast<std::uintptr_t>(skeleton_base_probe), 0x10)) {
+                            if (logged < 16) {
+                                char message[512] {};
+                                std::snprintf(message, sizeof(message),
+                                    "boneprobe %s candidate=%d actor=%08lx bone_ok=false skeleton_base=%08lx invalid_skeleton_base",
+                                    label ? label : "unknown",
+                                    matches,
+                                    static_cast<unsigned long>(actor),
+                                    static_cast<unsigned long>(skeleton_base_probe));
+                                append_log(message);
+                                ++logged;
+                            }
+                            continue;
+                        }
 
-                    ++matches;
-                    std::uint32_t skeleton_base_probe = 0;
-                    if (!read_memory(actor + 0x6B8, skeleton_base_probe) || !is_readable_range(static_cast<std::uintptr_t>(skeleton_base_probe), 0x10)) {
-                        if (logged < 16) {
-                            char message[512] {};
+                        float bone_x = 0.0f;
+                        float bone_y = 0.0f;
+                        float bone_z = 0.0f;
+                        char detail[512] {};
+                        const bool bone_ok = read_bone_anchor(actor, 2, bone_x, bone_y, bone_z, detail, sizeof(detail));
+                        if (bone_ok) {
+                            ++bone_matches;
+                            probe_actor_bones(label, actor, 256);
+                        }
+                        if (bone_ok || logged < 24) {
+                            char message[1024] {};
                             std::snprintf(message, sizeof(message),
-                                "boneprobe %s candidate=%d actor=%08lx bone_ok=false skeleton_base=%08lx invalid_skeleton_base",
+                                "boneprobe %s candidate=%d actor=%08lx bone_ok=%s anchor=(%.3f %.3f %.3f) %s",
                                 label ? label : "unknown",
                                 matches,
                                 static_cast<unsigned long>(actor),
-                                static_cast<unsigned long>(skeleton_base_probe));
+                                bone_ok ? "true" : "false",
+                                bone_x, bone_y, bone_z,
+                                detail);
                             append_log(message);
                             ++logged;
                         }
-                        continue;
                     }
 
-                    float bone_x = 0.0f;
-                    float bone_y = 0.0f;
-                    float bone_z = 0.0f;
-                    char detail[512] {};
-                    const bool bone_ok = read_bone_anchor(actor, 2, bone_x, bone_y, bone_z, detail, sizeof(detail));
-                    if (bone_ok) {
-                        ++bone_matches;
-                    }
-                    if (bone_ok || logged < 24) {
-                        char message[1024] {};
-                        std::snprintf(message, sizeof(message),
-                            "boneprobe %s candidate=%d actor=%08lx bone_ok=%s anchor=(%.3f %.3f %.3f) %s",
-                            label ? label : "unknown",
-                            matches,
-                            static_cast<unsigned long>(actor),
-                            bone_ok ? "true" : "false",
-                            bone_x, bone_y, bone_z,
-                            detail);
-                        append_log(message);
-                        ++logged;
-                    }
+#if defined(TARGETLINES_DIAGNOSTIC_BONE_SCAN)
+                    Sleep(1);
+#endif
                 }
             }
 
@@ -2173,6 +2418,11 @@ private:
             logged,
             bone_matches);
         append_log(summary);
+#if defined(TARGETLINES_DIAGNOSTIC_BONE_SCAN)
+        if (diagnostic_bone_probe_cancel_.load()) {
+            append_log("boneprobe target diagnostic scan cancelled");
+        }
+#endif
     }
 
     void probe_actor_identity_near_roots(const char* label, DWORD id, DWORD index, float lua_x, float lua_y, float lua_z) {
@@ -2460,6 +2710,8 @@ private:
             line.uid = parse_json_uint(cursor, "\"uid\"");
             line.source_id = parse_json_uint(source, "\"id\"");
             line.source_index = parse_json_uint(source, "\"index\"");
+            line.source_race = parse_json_uint(source, "\"race\"");
+            line.source_model = parse_json_uint(source, "\"model\"");
             line.source_x = parse_json_float(source, "\"x\"");
             line.source_y = parse_json_float(source, "\"y\"");
             line.source_z = parse_json_float(source, "\"z\"");
@@ -2473,6 +2725,8 @@ private:
             line.source_is_npc = parse_json_bool(source, "\"npc\"");
             line.target_id = parse_json_uint(target, "\"id\"");
             line.target_index = parse_json_uint(target, "\"index\"");
+            line.target_race = parse_json_uint(target, "\"race\"");
+            line.target_model = parse_json_uint(target, "\"model\"");
             line.target_x = parse_json_float(target, "\"x\"");
             line.target_y = parse_json_float(target, "\"y\"");
             line.target_z = parse_json_float(target, "\"z\"");
@@ -2618,6 +2872,8 @@ private:
                         RingTargetState& target = ring.targets[ring.target_count++];
                         target.id = parse_json_uint(target_open, "\"id\"");
                         target.index = parse_json_uint(target_open, "\"index\"");
+                        target.race = parse_json_uint(target_open, "\"race\"");
+                        target.model = parse_json_uint(target_open, "\"model\"");
                         target.x = parse_json_float(target_open, "\"x\"");
                         target.y = parse_json_float(target_open, "\"y\"");
                         target.z = parse_json_float(target_open, "\"z\"");
@@ -3099,6 +3355,18 @@ private:
     float width_scale_ = 1.0f;
     float glow_scale_ = 1.0f;
     int dynamic_bone_ = 21;
+    std::uintptr_t cached_mob_array_ = 0;
+    std::uintptr_t cached_mob_array_module_base_ = 0;
+    std::uintptr_t cached_mob_array_signature_ = 0;
+    DWORD next_mob_array_resolve_ms_ = 0;
+#if defined(TARGETLINES_DIAGNOSTIC_BONE_SCAN)
+    HANDLE diagnostic_bone_probe_thread_ = nullptr;
+    std::atomic<bool> diagnostic_bone_probe_running_ {false};
+    std::atomic<bool> diagnostic_bone_probe_cancel_ {false};
+    float diagnostic_probe_x_ = 0.0f;
+    float diagnostic_probe_y_ = 0.0f;
+    float diagnostic_probe_z_ = 0.0f;
+#endif
     LineState cached_lines_[128] {};
     int cached_line_count_ = 0;
     RingState cached_rings_[max_rings_per_state_] {};

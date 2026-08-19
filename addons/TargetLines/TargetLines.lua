@@ -1,6 +1,6 @@
 _addon.name = 'TargetLines'
 _addon.author = 'MogSafe'
-_addon.version = '1.0.4'
+_addon.version = '1.1.0'
 _addon.commands = {'targetlines', 'tl'}
 
 config = require('config')
@@ -34,8 +34,10 @@ defaults.show_player_lines = true
 defaults.show_party_lines = true
 defaults.show_enemy_lines = true
 defaults.show_pet_lines = true
+-- Retained in saved XML for migration compatibility with pre-v1.1 settings.
+-- aoe_mode and aoe_opacity_scale are the authoritative settings.
 defaults.show_fan_lines = true
-defaults.aoe_mode = 'fan'
+defaults.aoe_mode = 'ring1'
 defaults.ring_indicator_style = 'comet'
 defaults.show_special_lines = true
 defaults.show_other_party_lines = false
@@ -48,6 +50,23 @@ defaults.display = {}
 defaults.display.pos = {x = 160, y = 220}
 defaults.display.bg = {red = 0, green = 0, blue = 0, alpha = 150}
 defaults.display.text = {font = 'Consolas', size = 10, red = 255, green = 255, blue = 255, alpha = 255}
+
+local function read_existing_settings_xml()
+    local file = io.open(windower.addon_path .. 'data/settings.xml', 'rb')
+    if not file then
+        return nil
+    end
+
+    local contents = file:read('*a') or ''
+    file:close()
+    return contents
+end
+
+local existing_settings_xml = read_existing_settings_xml()
+local had_aoe_mode = existing_settings_xml
+    and existing_settings_xml:find('<aoe_mode>', 1, true) ~= nil
+local had_aoe_opacity = existing_settings_xml
+    and existing_settings_xml:find('<aoe_opacity_scale>', 1, true) ~= nil
 
 local settings = config.load(defaults)
 if settings.show_other_party_lines == nil then
@@ -75,16 +94,26 @@ elseif settings.aoe_mode ~= 'off' and settings.aoe_mode ~= 'fan'
     and settings.aoe_mode ~= 'ring1' and settings.aoe_mode ~= 'ring2' then
     settings.aoe_mode = defaults.aoe_mode
 end
--- Migrate the former AoE enable toggle into the unified mode.
-if settings.show_fan_lines == false then
-    settings.aoe_mode = 'off'
+-- Only let the former enable toggle choose a mode when the file predates
+-- aoe_mode. Windower's config saver retains old XML keys, so consulting the
+-- toggle on every load would make a migrated Off setting impossible to change.
+if existing_settings_xml and not had_aoe_mode then
+    settings.aoe_mode = settings.show_fan_lines == false and 'off' or defaults.aoe_mode
 end
-settings.show_fan_lines = nil
-settings.ring_indicator_style = nil
-if settings.aoe_opacity_scale == nil then
+
+-- Defaults are merged before this code runs, so nil cannot identify whether
+-- aoe_opacity_scale existed on disk. Use the original XML schema instead.
+if existing_settings_xml and not had_aoe_opacity and settings.fan_opacity_scale ~= nil then
     settings.aoe_opacity_scale = tonumber(settings.fan_opacity_scale) or defaults.aoe_opacity_scale
 end
-settings.fan_opacity_scale = nil
+
+local function sync_aoe_compatibility_settings()
+    settings.show_fan_lines = settings.aoe_mode ~= 'off'
+    settings.ring_indicator_style = settings.aoe_mode == 'ring2' and 'contracting_ring' or 'comet'
+    settings.fan_opacity_scale = tonumber(settings.aoe_opacity_scale) or defaults.aoe_opacity_scale
+end
+
+sync_aoe_compatibility_settings()
 for _, opacity_key in ipairs({'player_opacity_scale', 'ally_opacity_scale', 'enemy_opacity_scale'}) do
     local saved_opacity = tonumber(settings[opacity_key])
     if saved_opacity == 1.0 then
@@ -222,8 +251,8 @@ local preset_rows = {
     },
     aoe_mode = {
         {'Fan', 'fan'},
-        {'Ring 1', 'ring1'},
-        {'Ring 2', 'ring2'},
+        {'Ring (A)', 'ring1'},
+        {'Ring (B)', 'ring2'},
         {'Off', 'off'},
     },
 }
@@ -422,6 +451,7 @@ end
 local function set_aoe_indicator_mode(mode)
     settings.aoe_mode = mode
     clear_recent_aoe_visuals()
+    sync_aoe_compatibility_settings()
     config.save(settings)
     last_signature = ''
     update_config_box()
@@ -443,6 +473,7 @@ local function set_preset(name, direction)
         clear_recent_aoe_visuals()
     end
 
+    sync_aoe_compatibility_settings()
     config.save(settings)
     last_signature = ''
     update_config_box()
@@ -2118,6 +2149,7 @@ windower.register_event('addon command', function(command, ...)
             end
             settings.aoe_opacity_scale = opacity
         end
+        sync_aoe_compatibility_settings()
         config.save(settings)
         last_signature = ''
         update_config_box()

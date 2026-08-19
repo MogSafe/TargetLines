@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.25)
 
 project(TargetLines
-    VERSION 1.0.4
+    VERSION 1.1.0
     LANGUAGES CXX
 )
 
@@ -14,7 +14,7 @@ add_library(TargetLines SHARED
 set_target_properties(TargetLines PROPERTIES PREFIX "")
 
 target_compile_features(TargetLines PRIVATE cxx_std_17)
-target_compile_definitions(TargetLines PRIVATE WIN32_LEAN_AND_MEAN)
+target_link_libraries(TargetLines PRIVATE d3d8)
 
 if(MSVC)
     target_compile_options(TargetLines PRIVATE /W4 /EHsc)
