@@ -5,6 +5,7 @@
 #include <d3d8.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cmath>
 #include <ctime>
@@ -12,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <vector>
 
 namespace {
 HMODULE g_module = nullptr;
@@ -88,6 +90,9 @@ public:
     }
 
     void __stdcall Unload() override {
+#if defined(TARGETLINES_DIAGNOSTIC_BONE_SCAN)
+        stop_diagnostic_bone_probe();
+#endif
         append_log("unloaded");
         close_state_change_notification();
     }
@@ -299,7 +304,8 @@ private:
         }
 
         char message[256] {};
-        std::snprintf(message, sizeof(message), "device probe reason=%s manager=%p device=%p", reason ? reason : "unknown", plugin_manager_, device);
+        std::snprintf(message, sizeof(message), "device probe reason=%s manager=%p device=%p", reason ? reason : "unknown",
+            static_cast<void*>(plugin_manager_), static_cast<void*>(device));
         append_log(message);
         d3d_device_ = static_cast<IDirect3DDevice8*>(device);
     }
@@ -370,7 +376,8 @@ private:
 
         FFXI* ffxi = plugin_manager_ ? plugin_manager_->GetFFXI() : nullptr;
         char header[256] {};
-        std::snprintf(header, sizeof(header), "ffxiprobe manager=%p ffxi=%p", plugin_manager_, ffxi);
+        std::snprintf(header, sizeof(header), "ffxiprobe manager=%p ffxi=%p",
+            static_cast<void*>(plugin_manager_), static_cast<void*>(ffxi));
         append_log(header);
         if (!ffxi) {
             return;
@@ -471,17 +478,17 @@ private:
         }
 
         std::uintptr_t mob_array = 0;
-        std::uintptr_t lua_base = 0;
-        std::uintptr_t context = 0;
-        if (!get_luacore_mob_array(mob_array, &lua_base, &context)) {
-            append_log("luamobprobe LuaCore.dll not loaded");
+        std::uintptr_t module_base = 0;
+        std::uintptr_t signature = 0;
+        if (!get_luacore_mob_array(mob_array, &module_base, &signature)) {
+            append_log("luamobprobe mob array unavailable");
             return;
         }
 
         char message[256] {};
-        std::snprintf(message, sizeof(message), "luamobprobe base=%08lx context=%08lx mob_array=%08lx",
-            static_cast<unsigned long>(lua_base),
-            static_cast<unsigned long>(context),
+        std::snprintf(message, sizeof(message), "luamobprobe ffxi_base=%08lx signature=%08lx mob_array=%08lx",
+            static_cast<unsigned long>(module_base),
+            static_cast<unsigned long>(signature),
             static_cast<unsigned long>(mob_array));
         append_log(message);
 
@@ -655,7 +662,32 @@ private:
     }
 
     void probe_actor_bones(const char* label, std::uintptr_t actor, int max_bones) {
-        for (int bone = 0; bone < max_bones; ++bone) {
+        std::uint32_t skeleton_base = 0;
+        std::uint32_t skeleton_offset = 0;
+        std::uint32_t skeleton = 0;
+        std::uint16_t bone_count = 0;
+        if (!read_memory(actor + 0x6B8, skeleton_base) ||
+            !read_memory(static_cast<std::uintptr_t>(skeleton_base) + 0x0C, skeleton_offset) ||
+            !read_memory(static_cast<std::uintptr_t>(skeleton_offset), skeleton) ||
+            !read_memory(static_cast<std::uintptr_t>(skeleton) + 0x32, bone_count) ||
+            bone_count == 0 || bone_count > 256) {
+            char message[256] {};
+            std::snprintf(message, sizeof(message),
+                "boneprobe %s bone_enumeration_failed actor=%08lx bone_count=%u",
+                label ? label : "unknown", static_cast<unsigned long>(actor), bone_count);
+            append_log(message);
+            return;
+        }
+
+        const int sample_count = std::min(max_bones, static_cast<int>(bone_count));
+        char header[256] {};
+        std::snprintf(header, sizeof(header),
+            "boneprobe %s bone_enumeration_begin actor=%08lx bone_count=%u samples=%d",
+            label ? label : "unknown", static_cast<unsigned long>(actor), bone_count, sample_count);
+        append_log(header);
+
+        int logged = 0;
+        for (int bone = 0; bone < sample_count; ++bone) {
             float bone_x = 0.0f;
             float bone_y = 0.0f;
             float bone_z = 0.0f;
@@ -672,7 +704,14 @@ private:
                 bone_x, bone_y, bone_z,
                 detail);
             append_log(message);
+            ++logged;
         }
+
+        char summary[256] {};
+        std::snprintf(summary, sizeof(summary),
+            "boneprobe %s bone_enumeration_complete actor=%08lx logged=%d",
+            label ? label : "unknown", static_cast<unsigned long>(actor), logged);
+        append_log(summary);
     }
 
     void probe_actor_roots_near_pointer(const char* label, std::uintptr_t pointer, float lua_x, float lua_y, float lua_z) {
@@ -784,6 +823,10 @@ private:
         DWORD target_id = 0;
         DWORD source_index = 0;
         DWORD target_index = 0;
+        DWORD source_race = 0;
+        DWORD target_race = 0;
+        DWORD source_model = 0;
+        DWORD target_model = 0;
         float source_x = 0.0f;
         float source_y = 0.0f;
         float source_z = 0.0f;
@@ -802,6 +845,45 @@ private:
         bool target_is_npc = false;
         float timeout = 1.5f;
         DWORD color = 0xEFFFFFFF;
+    };
+
+    struct RingTargetState {
+        DWORD id = 0;
+        DWORD index = 0;
+        DWORD race = 0;
+        DWORD model = 0;
+        float x = 0.0f;
+        float y = 0.0f;
+        float z = 0.0f;
+        float model_size = 0.0f;
+        float model_scale = 1.0f;
+        bool short_anchor = false;
+        bool floating_anchor = false;
+        bool is_npc = false;
+    };
+
+    static constexpr int max_ring_targets_per_ring_ = 32;
+    static constexpr int max_rings_per_state_ = 8;
+    static constexpr float ring_marker_duration_ = 1.00f;
+
+    struct RingState {
+        DWORD uid = 0;
+        DWORD center_id = 0;
+        DWORD center_index = 0;
+        float center_x = 0.0f;
+        float center_y = 0.0f;
+        float center_z = 0.0f;
+        float center_model_size = 0.0f;
+        float center_model_scale = 1.0f;
+        bool center_short_anchor = false;
+        bool center_floating_anchor = false;
+        bool center_is_npc = false;
+        float radius = 0.0f;
+        float timeout = 1.5f;
+        DWORD color = 0xEFFFFFFF;
+        int indicator_style = 1;
+        int target_count = 0;
+        RingTargetState targets[max_ring_targets_per_ring_] {};
     };
 
     struct ActiveLine {
@@ -823,14 +905,22 @@ private:
         float z = 0.0f;
     };
 
+    struct ActiveRing {
+        unsigned long long key = 0;
+        DWORD start_ms = 0;
+        DWORD last_seen_ms = 0;
+    };
+
     void draw_lines() {
-        LineState lines[128] {};
-        const int line_count = read_lines(lines, 128);
-        if (line_count <= 0) {
+        LineState lines[16] {};
+        RingState rings[8] {};
+        const int line_count = read_state(lines, 16, rings, 8);
+        const int ring_count = last_ring_count_;
+        if (line_count <= 0 && ring_count <= 0) {
             return;
         }
 
-        if (boneprobe_requested_) {
+        if (boneprobe_requested_ && line_count > 0) {
             boneprobe_requested_ = false;
             const DWORD now_ms = GetTickCount();
             if (now_ms - last_boneprobe_ms_ > 1000) {
@@ -855,8 +945,8 @@ private:
         anchor_cache_count_ = 0;
 
         const DWORD now_ms = GetTickCount();
-        bool spread_sources[128] {};
-        bool spread_targets[128] {};
+        bool spread_sources[16] {};
+        bool spread_targets[16] {};
         prepare_new_line_relationships(lines, line_count, spread_sources, spread_targets);
 
         if (!begin_draw_state()) {
@@ -864,6 +954,10 @@ private:
         }
 
         begin_line_batch();
+        for (int i = 0; i < ring_count; ++i) {
+            draw_aoe_ring(rings[i], viewport, mob_array, now_ms);
+        }
+
         for (int i = 0; i < line_count; ++i) {
             ActiveLine* active = nullptr;
             float progress = 1.0f;
@@ -883,6 +977,7 @@ private:
         end_line_batch();
         end_draw_state();
         prune_active_lines(now_ms);
+        prune_active_rings(now_ms);
     }
 
     bool prepare_animated_line(const LineState& line, DWORD now_ms, bool spread_source, bool spread_target, ActiveLine*& active, float& progress, float& arc_settle, float& settle, float& tail, DWORD& color) {
@@ -959,9 +1054,9 @@ private:
         float p2_y = line.target_y;
         float p2_z = line.target_z + target_height;
         resolve_live_anchor_cached(mob_array, line.source_is_npc, line.source_index,
-            dynamic_bone_, source_height, p0_x, p0_y, p0_z);
+            anchor_bone_for_entity(line.source_race, line.source_model, line.source_is_npc), source_height, p0_x, p0_y, p0_z);
         resolve_live_anchor_cached(mob_array, line.target_is_npc, line.target_index,
-            dynamic_bone_, target_height, p2_x, p2_y, p2_z);
+            anchor_bone_for_entity(line.target_race, line.target_model, line.target_is_npc), target_height, p2_x, p2_y, p2_z);
         if (spread_source) {
             apply_source_spread(line, p0_x, p0_y);
         }
@@ -1107,6 +1202,269 @@ private:
         return (static_cast<unsigned long long>(uid) << 32) ^ (static_cast<unsigned long long>(source) << 16) ^ target;
     }
 
+    unsigned long long ring_key(const RingState& ring) const {
+        const DWORD center = ring.center_id ? ring.center_id : static_cast<DWORD>(std::fabs(ring.center_x * 100.0f) + std::fabs(ring.center_y * 100.0f));
+        const DWORD uid = ring.uid ? ring.uid : center;
+        return (static_cast<unsigned long long>(uid) << 32) ^ center;
+    }
+
+    void draw_aoe_ring(const RingState& ring, const D3DVIEWPORT8& viewport, std::uintptr_t mob_array, DWORD now_ms) {
+        if (ring.radius <= 0.1f) {
+            return;
+        }
+
+        const unsigned long long key = ring_key(ring);
+        ActiveRing* active = find_active_ring(key);
+        if (!active) {
+            active = allocate_active_ring(key, now_ms);
+        }
+
+        if (!active) {
+            return;
+        }
+
+        active->last_seen_ms = now_ms;
+        const float timeout = std::fmax(ring.timeout, 0.1f);
+        const float age = static_cast<float>(now_ms - active->start_ms) / 1000.0f;
+        const float pulse_duration = std::fmin(0.80f, timeout * 0.55f);
+        const float visual_lifetime = std::fmax(timeout, pulse_duration + ring_marker_duration_);
+        if (age > visual_lifetime) {
+            return;
+        }
+
+        const float fade_start = timeout * 0.55f;
+        float fade = 1.0f;
+        if (age > fade_start) {
+            fade = 1.0f - std::fmax(0.0f, std::fmin((age - fade_start) / std::fmax(timeout - fade_start, 0.1f), 1.0f));
+        }
+
+        const float pulse_t_raw = std::fmax(0.0f, std::fmin(age / std::fmax(pulse_duration, 0.05f), 1.0f));
+        const float inverse_t = 1.0f - pulse_t_raw;
+        const float pulse_t = 1.0f - std::pow(inverse_t, 1.5f);
+        constexpr float pulse_start_scale = 0.08f;
+        const float pulse_radius = ring.radius * (pulse_start_scale + (1.0f - pulse_start_scale) * pulse_t);
+        const float thickness = 10.5f * width_scale_;
+        const float haze_thickness = 16.5f * width_scale_ * (0.75f + glow_scale_ * 0.25f);
+        const float outer_attack_t = std::fmax(0.0f, std::fmin(age / 0.20f, 1.0f));
+        const float outer_attack = outer_attack_t * outer_attack_t * (3.0f - 2.0f * outer_attack_t);
+        const DWORD outer_color = scale_alpha(ring.color, 0.38f * outer_attack * fade * opacity_scale_);
+        const DWORD pulse_color = scale_alpha(ring.color, (0.82f - pulse_t * 0.18f) * fade * opacity_scale_);
+        const DWORD outer_haze_color = scale_alpha(saturate_color(ring.color), 0.16f * outer_attack * fade * opacity_scale_);
+        const DWORD pulse_haze_color = scale_alpha(saturate_color(ring.color), 0.24f * fade * opacity_scale_);
+
+        float center_x = ring.center_x;
+        float center_y = ring.center_y;
+        const float center_height = model_adjusted_height(source_height_offset_, ring.center_model_size,
+            ring.center_model_scale, ring.center_short_anchor, ring.center_floating_anchor, ring.center_is_npc);
+        float center_z = ring.center_z + center_height;
+        // Keep the AoE footprint at the action-time position. Impact markers
+        // still resolve their targets live below so they remain attached to
+        // affected entities while the stationary ring shows where the effect
+        // occurred.
+
+        if (age <= timeout) {
+            draw_projected_ring(viewport, center_x, center_y, center_z, ring.radius, haze_thickness, outer_haze_color);
+            draw_projected_ring(viewport, center_x, center_y, center_z, ring.radius, thickness, outer_color);
+            draw_projected_ring(viewport, center_x, center_y, center_z, std::fmax(0.05f, pulse_radius), haze_thickness, pulse_haze_color);
+            draw_projected_ring(viewport, center_x, center_y, center_z, std::fmax(0.05f, pulse_radius), thickness, pulse_color);
+        }
+
+        for (int i = 0; i < ring.target_count; ++i) {
+            const RingTargetState& target = ring.targets[i];
+            const bool center_target_by_id = ring.center_id != 0 && target.id != 0
+                && ring.center_id == target.id;
+            const bool center_target_by_index = ring.center_index != 0 && target.index != 0
+                && ring.center_index == target.index && ring.center_is_npc == target.is_npc;
+            draw_ring_impact_marker(target, viewport, mob_array, center_x, center_y,
+                ring.radius, age, pulse_duration, ring.color, ring.indicator_style,
+                center_target_by_id || center_target_by_index);
+        }
+    }
+
+    void draw_projected_ring(const D3DVIEWPORT8& viewport, float center_x, float center_y, float center_z, float radius, float thickness, DWORD color) {
+        constexpr int segments = 72;
+        DrawVertex vertices[segments * 6] {};
+        int vertex_count = 0;
+        float previous_x = 0.0f;
+        float previous_y = 0.0f;
+        bool previous_ok = false;
+
+        for (int i = 0; i <= segments; ++i) {
+            const float angle = (static_cast<float>(i) / static_cast<float>(segments)) * 6.28318530718f;
+            const float world_x = center_x + std::cos(angle) * radius;
+            const float world_y = center_y + std::sin(angle) * radius;
+            float screen_x = 0.0f;
+            float screen_y = 0.0f;
+            const bool ok = live_world_to_screen(world_x, world_y, center_z, viewport, screen_x, screen_y);
+            if (ok && previous_ok && vertex_count <= (segments * 6 - 6)) {
+                const float segment_dx = screen_x - previous_x;
+                const float segment_dy = screen_y - previous_y;
+                const float segment_length = std::sqrt(segment_dx * segment_dx + segment_dy * segment_dy);
+                if (segment_length > 0.01f) {
+                    append_segment_quad_with_normal(vertices, vertex_count, previous_x, previous_y,
+                        screen_x, screen_y, -segment_dy / segment_length, segment_dx / segment_length,
+                        thickness, color);
+                }
+            }
+
+            previous_x = screen_x;
+            previous_y = screen_y;
+            previous_ok = ok;
+        }
+
+        if (vertex_count > 0) {
+            draw_vertices(D3DPT_TRIANGLELIST, vertex_count / 3, vertices, sizeof(DrawVertex));
+        }
+    }
+
+    void draw_projected_comet_arc(const D3DVIEWPORT8& viewport, float center_x, float center_y, float center_z,
+        float radius, float thickness, DWORD glow_color, DWORD backing_color, DWORD core_color, DWORD shine_color,
+        float head_phase, float tail_extent, float head_extent) {
+        constexpr int max_segments = 72;
+        const float total_extent = std::fmax(tail_extent + head_extent, 0.02f);
+        const float tail_fraction = std::fmax(0.0f, tail_extent) / total_extent;
+        const int segments = std::max(8, std::min(max_segments,
+            static_cast<int>(std::ceil(total_extent / 6.28318530718f * static_cast<float>(max_segments)))));
+        DrawVertex glow_vertices[max_segments * 6] {};
+        DrawVertex backing_vertices[max_segments * 6] {};
+        DrawVertex core_vertices[max_segments * 6] {};
+        DrawVertex shine_vertices[max_segments * 6] {};
+        int glow_vertex_count = 0;
+        int backing_vertex_count = 0;
+        int core_vertex_count = 0;
+        int shine_vertex_count = 0;
+
+        for (int i = 0; i < segments; ++i) {
+            const float u0 = static_cast<float>(i) / static_cast<float>(segments);
+            const float u1 = static_cast<float>(i + 1) / static_cast<float>(segments);
+            const float middle_u = (u0 + u1) * 0.5f;
+            const float angle0 = head_phase - total_extent + total_extent * u0;
+            const float angle1 = head_phase - total_extent + total_extent * u1;
+            float screen_x0 = 0.0f;
+            float screen_y0 = 0.0f;
+            float screen_x1 = 0.0f;
+            float screen_y1 = 0.0f;
+            if (!live_world_to_screen(center_x + std::cos(angle0) * radius, center_y + std::sin(angle0) * radius,
+                    center_z, viewport, screen_x0, screen_y0)
+                || !live_world_to_screen(center_x + std::cos(angle1) * radius, center_y + std::sin(angle1) * radius,
+                    center_z, viewport, screen_x1, screen_y1)) {
+                continue;
+            }
+
+            float intensity = 1.0f;
+            float width_scale = 1.0f;
+            if (middle_u < tail_fraction) {
+                const float tail_t = middle_u / tail_fraction;
+                intensity = 0.10f + 0.90f * tail_t * tail_t;
+                width_scale = 0.28f + 0.72f * tail_t;
+            }
+
+            const float segment_dx = screen_x1 - screen_x0;
+            const float segment_dy = screen_y1 - screen_y0;
+            const float segment_length = std::sqrt(segment_dx * segment_dx + segment_dy * segment_dy);
+            if (segment_length <= 0.01f) {
+                continue;
+            }
+            const float normal_x = -segment_dy / segment_length;
+            const float normal_y = segment_dx / segment_length;
+            append_segment_quad_with_normal(glow_vertices, glow_vertex_count, screen_x0, screen_y0, screen_x1, screen_y1,
+                normal_x, normal_y, thickness * 2.35f * width_scale, scale_alpha(glow_color, intensity));
+            append_segment_quad_with_normal(backing_vertices, backing_vertex_count, screen_x0, screen_y0, screen_x1, screen_y1,
+                normal_x, normal_y, thickness * 1.70f * width_scale, scale_alpha(backing_color, intensity));
+            append_segment_quad_with_normal(core_vertices, core_vertex_count, screen_x0, screen_y0, screen_x1, screen_y1,
+                normal_x, normal_y, thickness * width_scale, scale_alpha(core_color, intensity));
+            if (middle_u >= 0.86f) {
+                const float shine_t = (middle_u - 0.86f) / 0.14f;
+                append_segment_quad_with_normal(shine_vertices, shine_vertex_count, screen_x0, screen_y0, screen_x1, screen_y1,
+                    normal_x, normal_y, std::fmax(1.25f, thickness * 0.32f), scale_alpha(shine_color, shine_t));
+            }
+        }
+
+        if (glow_vertex_count > 0) {
+            draw_vertices(D3DPT_TRIANGLELIST, glow_vertex_count / 3, glow_vertices, sizeof(DrawVertex));
+        }
+        if (backing_vertex_count > 0) {
+            draw_vertices(D3DPT_TRIANGLELIST, backing_vertex_count / 3, backing_vertices, sizeof(DrawVertex));
+        }
+        if (core_vertex_count > 0) {
+            draw_vertices(D3DPT_TRIANGLELIST, core_vertex_count / 3, core_vertices, sizeof(DrawVertex));
+        }
+        if (shine_vertex_count > 0) {
+            draw_vertices(D3DPT_TRIANGLELIST, shine_vertex_count / 3, shine_vertices, sizeof(DrawVertex));
+        }
+    }
+
+    void draw_ring_impact_marker(const RingTargetState& target, const D3DVIEWPORT8& viewport, std::uintptr_t mob_array,
+        float center_x, float center_y, float ring_radius, float ring_age, float pulse_duration, DWORD color,
+        int indicator_style, bool center_target) {
+        float target_x = target.x;
+        float target_y = target.y;
+        const float target_height = model_adjusted_height(target_height_offset_, target.model_size, target.model_scale,
+            target.short_anchor, target.floating_anchor, target.is_npc);
+        float target_z = target.z + target_height;
+        resolve_live_anchor_cached(mob_array, target.is_npc, target.index,
+            anchor_bone_for_entity(target.race, target.model, target.is_npc), target_height, target_x, target_y, target_z);
+
+        const float target_scale = target.model_scale > 0.0f ? target.model_scale : 1.0f;
+        const float effective_size = std::fmax(0.0f, target.model_size * target_scale);
+        const float halo_radius = std::fmax(0.80f, std::fmin(0.75f + effective_size * 0.18f, 1.35f));
+
+        const float dx = target_x - center_x;
+        const float dy = target_y - center_y;
+        const float distance_ratio = std::fmax(0.0f,
+            std::fmin(std::sqrt(dx * dx + dy * dy) / std::fmax(ring_radius, 0.1f), 1.0f));
+        float marker_age = 0.0f;
+        if (center_target) {
+            // Play the center marker last so it does not compound visually with
+            // the inner pulse while that pulse is expanding from the same point.
+            marker_age = ring_age - pulse_duration;
+        } else {
+            constexpr float pulse_start_scale = 0.08f;
+            const float wave_ratio = std::fmax(0.0f, std::fmin((distance_ratio - pulse_start_scale) / (1.0f - pulse_start_scale), 1.0f));
+            const float arrival_t = 1.0f - std::pow(std::fmax(0.0f, 1.0f - wave_ratio), 2.0f / 3.0f);
+            marker_age = ring_age - pulse_duration * arrival_t;
+        }
+        if (marker_age < 0.0f || marker_age > ring_marker_duration_) {
+            return;
+        }
+
+        const float marker_t = std::fmax(0.0f, std::fmin(marker_age / ring_marker_duration_, 1.0f));
+        const float attack = std::fmin(marker_age / 0.10f, 1.0f);
+        const float fade_start = ring_marker_duration_ * 0.55f;
+        const float fade = marker_age <= fade_start ? 1.0f
+            : 1.0f - std::fmax(0.0f, std::fmin((marker_age - fade_start)
+                / std::fmax(ring_marker_duration_ - fade_start, 0.1f), 1.0f));
+        const float alpha = attack * fade * opacity_scale_;
+        if (alpha <= 0.01f) {
+            return;
+        }
+
+        const float line_core_thickness = 10.5f * width_scale_;
+        const DWORD saturated_color = saturate_color(color);
+
+        const float halo_phase = marker_t * 3.49065850399f;
+        const DWORD halo_backing_color = scale_alpha(darken_color(saturated_color), 0.82f * alpha);
+        const DWORD halo_glow_color = scale_alpha(saturated_color, 0.26f * alpha);
+        const DWORD halo_core_color = scale_alpha(saturated_color, 1.10f * alpha);
+        const DWORD halo_shine_color = scale_alpha(tint_white_color(saturated_color, 0.72f), 1.08f * alpha);
+
+        const float halo_thickness = std::fmax(4.0f, line_core_thickness * 0.52f);
+        if (indicator_style == 10) {
+            const float contract_t = marker_t * marker_t * (3.0f - 2.0f * marker_t);
+            const float contract_radius = halo_radius * (1.45f - 0.75f * contract_t);
+            draw_projected_ring(viewport, target_x, target_y, target_z, contract_radius,
+                halo_thickness * 1.65f, halo_glow_color);
+            draw_projected_ring(viewport, target_x, target_y, target_z, contract_radius,
+                halo_thickness * 1.22f, halo_backing_color);
+            draw_projected_ring(viewport, target_x, target_y, target_z, contract_radius,
+                halo_thickness * 0.62f, halo_core_color);
+        } else {
+            draw_projected_comet_arc(viewport, target_x, target_y, target_z, halo_radius,
+                halo_thickness, halo_glow_color, halo_backing_color, halo_core_color,
+                halo_shine_color, halo_phase, 5.58505360638f, 0.69813170080f);
+        }
+    }
+
     bool same_target(const LineState& left, const LineState& right) const {
         if (left.target_id != 0 && right.target_id != 0) {
             return left.target_id == right.target_id;
@@ -1239,6 +1597,23 @@ private:
         return manual_offset - auto_raise;
     }
 
+    int anchor_bone_for_entity(DWORD race, DWORD model, bool is_npc) const {
+        // Auto mode uses the visually verified torso bone for each humanoid
+        // skeleton. Mithra (race 7) maps bone 21 near the head; bone 39 is the
+        // centered upper-chest equivalent. A few unique trust models have the
+        // same visual mismatch despite reporting other race data. Explicit
+        // non-auto bone selections remain global diagnostic overrides.
+        const bool model_uses_bone_39 =
+            (race == 2 && model == 3033) || // Najelith
+            (race == 0 && model == 3041) || // Cid
+            (race == 2 && model == 3071);   // Margret
+        if (is_npc && dynamic_bone_ == 21 &&
+            (race == 7 || model_uses_bone_39)) {
+            return 39;
+        }
+        return dynamic_bone_;
+    }
+
     bool resolve_live_anchor(std::uintptr_t mob_array, bool is_npc, DWORD index, int bone,
         float& lua_x, float& lua_y, float& lua_z, bool& uses_height_offset) {
         if (mob_array == 0 || index == 0 || index >= 0x900) {
@@ -1316,6 +1691,39 @@ private:
         return &active;
     }
 
+    ActiveRing* find_active_ring(unsigned long long key) {
+        for (int i = 0; i < active_ring_count_; ++i) {
+            if (active_rings_[i].key == key) {
+                return &active_rings_[i];
+            }
+        }
+
+        return nullptr;
+    }
+
+    ActiveRing* allocate_active_ring(unsigned long long key, DWORD now_ms) {
+        if (active_ring_count_ < max_active_rings_) {
+            ActiveRing& active = active_rings_[active_ring_count_++];
+            active.key = key;
+            active.start_ms = now_ms;
+            active.last_seen_ms = now_ms;
+            return &active;
+        }
+
+        int oldest = 0;
+        for (int i = 1; i < active_ring_count_; ++i) {
+            if (active_rings_[i].last_seen_ms < active_rings_[oldest].last_seen_ms) {
+                oldest = i;
+            }
+        }
+
+        ActiveRing& active = active_rings_[oldest];
+        active.key = key;
+        active.start_ms = now_ms;
+        active.last_seen_ms = now_ms;
+        return &active;
+    }
+
     void prune_active_lines(DWORD now_ms) {
         int write = 0;
         for (int read = 0; read < active_line_count_; ++read) {
@@ -1328,6 +1736,20 @@ private:
         }
 
         active_line_count_ = write;
+    }
+
+    void prune_active_rings(DWORD now_ms) {
+        int write = 0;
+        for (int read = 0; read < active_ring_count_; ++read) {
+            if (now_ms - active_rings_[read].last_seen_ms <= 5000) {
+                if (write != read) {
+                    active_rings_[write] = active_rings_[read];
+                }
+                ++write;
+            }
+        }
+
+        active_ring_count_ = write;
     }
 
     DWORD scale_alpha(DWORD color, float scale) {
@@ -1485,9 +1907,59 @@ private:
             return;
         }
 
+#if defined(TARGETLINES_DIAGNOSTIC_BONE_SCAN)
+        start_diagnostic_bone_probe(lines[0].target_x, lines[0].target_y, lines[0].target_z);
+#else
         probe_actor_candidates("source", lines[0].source_id, lines[0].source_index, lines[0].source_x, lines[0].source_y, lines[0].source_z);
         probe_actor_candidates("target", lines[0].target_id, lines[0].target_index, lines[0].target_x, lines[0].target_y, lines[0].target_z);
+#endif
     }
+
+#if defined(TARGETLINES_DIAGNOSTIC_BONE_SCAN)
+    static DWORD WINAPI diagnostic_bone_probe_thread_entry(void* context) {
+        TargetLinesPlugin* self = static_cast<TargetLinesPlugin*>(context);
+        self->probe_actor_coordinate_scan("target", self->diagnostic_probe_x_, self->diagnostic_probe_y_, self->diagnostic_probe_z_);
+        self->diagnostic_bone_probe_running_.store(false);
+        return 0;
+    }
+
+    void start_diagnostic_bone_probe(float x, float y, float z) {
+        if (diagnostic_bone_probe_thread_ &&
+            WaitForSingleObject(diagnostic_bone_probe_thread_, 0) == WAIT_OBJECT_0) {
+            CloseHandle(diagnostic_bone_probe_thread_);
+            diagnostic_bone_probe_thread_ = nullptr;
+        }
+
+        if (diagnostic_bone_probe_running_.load()) {
+            append_log("boneprobe target diagnostic scan already running");
+            return;
+        }
+
+        diagnostic_probe_x_ = x;
+        diagnostic_probe_y_ = y;
+        diagnostic_probe_z_ = z;
+        diagnostic_bone_probe_cancel_.store(false);
+        diagnostic_bone_probe_running_.store(true);
+        diagnostic_bone_probe_thread_ = CreateThread(nullptr, 0, diagnostic_bone_probe_thread_entry, this, 0, nullptr);
+        if (!diagnostic_bone_probe_thread_) {
+            diagnostic_bone_probe_running_.store(false);
+            append_log("boneprobe target diagnostic thread creation failed");
+            return;
+        }
+
+        append_log("boneprobe target diagnostic scan started in background");
+    }
+
+    void stop_diagnostic_bone_probe() {
+        diagnostic_bone_probe_cancel_.store(true);
+        if (diagnostic_bone_probe_thread_) {
+            WaitForSingleObject(diagnostic_bone_probe_thread_, INFINITE);
+            CloseHandle(diagnostic_bone_probe_thread_);
+            diagnostic_bone_probe_thread_ = nullptr;
+        }
+        diagnostic_bone_probe_running_.store(false);
+    }
+#endif
 
     bool is_readable_page(DWORD protect) const {
         if (protect & (PAGE_GUARD | PAGE_NOACCESS)) {
@@ -1579,37 +2051,132 @@ private:
         return true;
     }
 
-    bool get_luacore_mob_array(std::uintptr_t& mob_array, std::uintptr_t* lua_base_out, std::uintptr_t* context_out) {
+    bool get_luacore_mob_array(std::uintptr_t& mob_array, std::uintptr_t* module_base_out, std::uintptr_t* signature_out) {
         mob_array = 0;
-        if (lua_base_out) {
-            *lua_base_out = 0;
+        if (module_base_out) {
+            *module_base_out = 0;
         }
-        if (context_out) {
-            *context_out = 0;
+        if (signature_out) {
+            *signature_out = 0;
         }
 
-        HMODULE lua_core = GetModuleHandleA("LuaCore.dll");
-        if (!lua_core) {
+        if (cached_mob_array_ != 0 &&
+            is_readable_range(cached_mob_array_, sizeof(std::uintptr_t) * 0x900)) {
+            mob_array = cached_mob_array_;
+            if (module_base_out) {
+                *module_base_out = cached_mob_array_module_base_;
+            }
+            if (signature_out) {
+                *signature_out = cached_mob_array_signature_;
+            }
+            return true;
+        }
+
+        cached_mob_array_ = 0;
+        const DWORD now_ms = GetTickCount();
+        if (now_ms < next_mob_array_resolve_ms_) {
+            return false;
+        }
+        next_mob_array_resolve_ms_ = now_ms + 5000;
+
+        HMODULE ffxi_main = GetModuleHandleA("FFXiMain.dll");
+        if (!ffxi_main) {
             return false;
         }
 
-        const std::uintptr_t lua_base = reinterpret_cast<std::uintptr_t>(lua_core);
-        const std::uintptr_t context_global = lua_base + 0x1c8400;
-        std::uintptr_t context = 0;
-        if (!read_memory(context_global, context) ||
-            !read_memory(context + 0x24, mob_array) ||
-            !is_readable_range(mob_array, sizeof(std::uintptr_t) * 0x900)) {
-            mob_array = 0;
+        const std::uintptr_t module_base = reinterpret_cast<std::uintptr_t>(ffxi_main);
+        IMAGE_DOS_HEADER dos {};
+        if (!read_memory(module_base, dos) || dos.e_magic != IMAGE_DOS_SIGNATURE) {
             return false;
         }
 
-        if (lua_base_out) {
-            *lua_base_out = lua_base;
+        IMAGE_NT_HEADERS32 nt {};
+        const std::uintptr_t nt_address = module_base + static_cast<std::uintptr_t>(dos.e_lfanew);
+        if (!read_memory(nt_address, nt) || nt.Signature != IMAGE_NT_SIGNATURE ||
+            nt.FileHeader.NumberOfSections == 0 || nt.FileHeader.NumberOfSections > 96) {
+            return false;
         }
-        if (context_out) {
-            *context_out = context;
+
+        // LuaCore uses this FFXiMain instruction sequence to resolve its mob
+        // pointer array: mov edx,[esi+0Ch]; mov eax,[edx+ebp]; mov eax,[eax*4+imm32].
+        // The relocated imm32 immediately following the signature is the array.
+        static constexpr unsigned char mob_array_signature[] = {
+            0x8B, 0x56, 0x0C, 0x8B, 0x04, 0x2A, 0x8B, 0x04, 0x85,
+        };
+
+        const std::uintptr_t section_table = nt_address +
+            sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER) + nt.FileHeader.SizeOfOptionalHeader;
+        for (WORD section_index = 0; section_index < nt.FileHeader.NumberOfSections; ++section_index) {
+            IMAGE_SECTION_HEADER section {};
+            const std::uintptr_t section_header = section_table +
+                static_cast<std::uintptr_t>(section_index) * sizeof(IMAGE_SECTION_HEADER);
+            if (!read_memory(section_header, section) ||
+                (section.Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) {
+                continue;
+            }
+
+            const std::size_t section_size = static_cast<std::size_t>(section.Misc.VirtualSize);
+            if (section_size < sizeof(mob_array_signature) + sizeof(std::uint32_t) ||
+                section_size > 0x2000000) {
+                continue;
+            }
+
+            const std::uintptr_t section_begin = module_base + section.VirtualAddress;
+            const std::uintptr_t section_end = section_begin + section_size;
+            std::uintptr_t region_address = section_begin;
+            while (region_address < section_end) {
+                MEMORY_BASIC_INFORMATION mbi {};
+                if (!VirtualQuery(reinterpret_cast<const void*>(region_address), &mbi, sizeof(mbi))) {
+                    break;
+                }
+
+                const std::uintptr_t region_begin = std::max(
+                    region_address, reinterpret_cast<std::uintptr_t>(mbi.BaseAddress));
+                const std::uintptr_t region_end = std::min(
+                    section_end, reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) +
+                        static_cast<std::uintptr_t>(mbi.RegionSize));
+                if (mbi.State == MEM_COMMIT && is_readable_page(mbi.Protect) &&
+                    region_end > region_begin + sizeof(mob_array_signature) + sizeof(std::uint32_t)) {
+                    const unsigned char* bytes = reinterpret_cast<const unsigned char*>(region_begin);
+                    const std::size_t region_size = static_cast<std::size_t>(region_end - region_begin);
+                    for (std::size_t offset = 0;
+                        offset + sizeof(mob_array_signature) + sizeof(std::uint32_t) <= region_size;
+                        ++offset) {
+                        if (std::memcmp(bytes + offset, mob_array_signature, sizeof(mob_array_signature)) != 0) {
+                            continue;
+                        }
+
+                        std::uint32_t candidate = 0;
+                        std::memcpy(&candidate, bytes + offset + sizeof(mob_array_signature), sizeof(candidate));
+                        const std::uintptr_t candidate_address = static_cast<std::uintptr_t>(candidate);
+                        if (!is_readable_range(candidate_address, sizeof(std::uintptr_t) * 0x900)) {
+                            continue;
+                        }
+
+                        mob_array = candidate_address;
+                        cached_mob_array_ = candidate_address;
+                        cached_mob_array_module_base_ = module_base;
+                        cached_mob_array_signature_ = region_begin + offset;
+                        if (module_base_out) {
+                            *module_base_out = module_base;
+                        }
+                        if (signature_out) {
+                            *signature_out = cached_mob_array_signature_;
+                        }
+                        append_log("mob array resolved from FFXiMain signature");
+                        return true;
+                    }
+                }
+
+                if (region_end <= region_address) {
+                    break;
+                }
+                region_address = region_end;
+            }
         }
-        return true;
+
+        append_log("mob array FFXiMain signature not found");
+        return false;
     }
 
     bool read_bone_anchor(std::uintptr_t actor, int bone, float& lua_x, float& lua_y, float& lua_z, char* detail, std::size_t detail_size) {
@@ -1704,9 +2271,18 @@ private:
         append_log(header);
 
         probe_actor_identity_near_roots(label, id, index, lua_x, lua_y, lua_z);
+#if defined(TARGETLINES_DIAGNOSTIC_BONE_SCAN)
+        if (label && std::strcmp(label, "target") == 0) {
+            append_log("boneprobe target diagnostic coordinate scan starting; rendering may pause briefly");
+            probe_actor_coordinate_scan(label, lua_x, lua_y, lua_z);
+        } else {
+            append_log("boneprobe source coordinate scan skipped in target-only diagnostic build");
+        }
+#else
         append_log(label && std::strcmp(label, "source") == 0
             ? "boneprobe source coordinate scan disabled: render-thread process scan is too expensive"
             : "boneprobe target coordinate scan disabled: render-thread process scan is too expensive");
+#endif
     }
 
     void probe_actor_coordinate_scan(const char* label, float lua_x, float lua_y, float lua_z) {
@@ -1714,6 +2290,8 @@ private:
         GetSystemInfo(&info);
         std::uintptr_t address = reinterpret_cast<std::uintptr_t>(info.lpMinimumApplicationAddress);
         const std::uintptr_t max_address = reinterpret_cast<std::uintptr_t>(info.lpMaximumApplicationAddress);
+        constexpr SIZE_T scan_chunk_size = 4 * 1024 * 1024;
+        std::vector<std::uint8_t> scan_buffer(scan_chunk_size + 8);
 
         int matches = 0;
         int logged = 0;
@@ -1721,76 +2299,103 @@ private:
         int regions = 0;
         unsigned long scanned_mb = 0;
         MEMORY_BASIC_INFORMATION mbi {};
-        while (bone_matches < 4 && address < max_address && VirtualQuery(reinterpret_cast<const void*>(address), &mbi, sizeof(mbi))) {
+        while (bone_matches < 1 && address < max_address &&
+#if defined(TARGETLINES_DIAGNOSTIC_BONE_SCAN)
+            !diagnostic_bone_probe_cancel_.load() &&
+#endif
+            VirtualQuery(reinterpret_cast<const void*>(address), &mbi, sizeof(mbi))) {
             const std::uintptr_t region_base = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress);
             std::uintptr_t region_end = region_base + mbi.RegionSize;
             if (region_end > max_address) {
                 region_end = max_address;
             }
-            if (mbi.State == MEM_COMMIT && is_readable_page(mbi.Protect) && mbi.RegionSize > 0x700) {
+            if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE &&
+                is_readable_page(mbi.Protect) && mbi.RegionSize > 0x700) {
                 ++regions;
                 scanned_mb += static_cast<unsigned long>(mbi.RegionSize / (1024 * 1024));
-                const std::uintptr_t scan_begin = region_base + 0x678;
-                const std::uintptr_t scan_end = region_end > 0x684 ? region_end - 0x684 : scan_begin;
-                for (std::uintptr_t pos = scan_begin; bone_matches < 4 && pos < scan_end; pos += sizeof(float)) {
-                    float value = 0.0f;
-                    if (!read_memory_raw(pos, value)) {
+                for (std::uintptr_t chunk_base = region_base;
+                    bone_matches < 1 && chunk_base < region_end
+#if defined(TARGETLINES_DIAGNOSTIC_BONE_SCAN)
+                        && !diagnostic_bone_probe_cancel_.load()
+#endif
+                    ;
+                    chunk_base += scan_chunk_size) {
+                    const SIZE_T remaining = static_cast<SIZE_T>(region_end - chunk_base);
+                    const SIZE_T bytes_requested = std::min(remaining, scan_chunk_size + 8);
+                    SIZE_T bytes_read = 0;
+                    if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(chunk_base),
+                            scan_buffer.data(), bytes_requested, &bytes_read) || bytes_read < 12) {
                         continue;
                     }
 
-                    if (std::fabs(value - lua_x) > 0.05f) {
-                        continue;
-                    }
+                    const std::uintptr_t scan_begin = std::max(chunk_base, region_base + 0x678);
+                    const SIZE_T first_offset = static_cast<SIZE_T>(scan_begin - chunk_base);
+                    for (SIZE_T offset = first_offset; bone_matches < 1 && offset + 12 <= bytes_read; offset += sizeof(float)) {
+#if defined(TARGETLINES_DIAGNOSTIC_BONE_SCAN)
+                        if ((offset & 0x3FFFF) == 0 && diagnostic_bone_probe_cancel_.load()) {
+                            break;
+                        }
+#endif
+                        float root_x = 0.0f;
+                        float root_z = 0.0f;
+                        float root_y = 0.0f;
+                        std::memcpy(&root_x, scan_buffer.data() + offset, sizeof(float));
+                        if (std::fabs(root_x - lua_x) > 0.05f) {
+                            continue;
+                        }
 
-                    const std::uintptr_t actor = pos - 0x678;
-                    float root_z = 0.0f;
-                    float root_y = 0.0f;
-                    if (!read_memory_raw(actor + 0x67C, root_z) || !read_memory_raw(actor + 0x680, root_y)) {
-                        continue;
-                    }
+                        std::memcpy(&root_z, scan_buffer.data() + offset + 4, sizeof(float));
+                        std::memcpy(&root_y, scan_buffer.data() + offset + 8, sizeof(float));
+                        if (std::fabs(root_z - lua_z) > 0.10f || std::fabs(root_y - lua_y) > 0.10f) {
+                            continue;
+                        }
 
-                    if (std::fabs(root_z - lua_z) > 0.10f || std::fabs(root_y - lua_y) > 0.10f) {
-                        continue;
-                    }
+                        const std::uintptr_t pos = chunk_base + offset;
+                        const std::uintptr_t actor = pos - 0x678;
+                        ++matches;
+                        std::uint32_t skeleton_base_probe = 0;
+                        if (!read_memory(actor + 0x6B8, skeleton_base_probe) || !is_readable_range(static_cast<std::uintptr_t>(skeleton_base_probe), 0x10)) {
+                            if (logged < 16) {
+                                char message[512] {};
+                                std::snprintf(message, sizeof(message),
+                                    "boneprobe %s candidate=%d actor=%08lx bone_ok=false skeleton_base=%08lx invalid_skeleton_base",
+                                    label ? label : "unknown",
+                                    matches,
+                                    static_cast<unsigned long>(actor),
+                                    static_cast<unsigned long>(skeleton_base_probe));
+                                append_log(message);
+                                ++logged;
+                            }
+                            continue;
+                        }
 
-                    ++matches;
-                    std::uint32_t skeleton_base_probe = 0;
-                    if (!read_memory(actor + 0x6B8, skeleton_base_probe) || !is_readable_range(static_cast<std::uintptr_t>(skeleton_base_probe), 0x10)) {
-                        if (logged < 16) {
-                            char message[512] {};
+                        float bone_x = 0.0f;
+                        float bone_y = 0.0f;
+                        float bone_z = 0.0f;
+                        char detail[512] {};
+                        const bool bone_ok = read_bone_anchor(actor, 2, bone_x, bone_y, bone_z, detail, sizeof(detail));
+                        if (bone_ok) {
+                            ++bone_matches;
+                            probe_actor_bones(label, actor, 256);
+                        }
+                        if (bone_ok || logged < 24) {
+                            char message[1024] {};
                             std::snprintf(message, sizeof(message),
-                                "boneprobe %s candidate=%d actor=%08lx bone_ok=false skeleton_base=%08lx invalid_skeleton_base",
+                                "boneprobe %s candidate=%d actor=%08lx bone_ok=%s anchor=(%.3f %.3f %.3f) %s",
                                 label ? label : "unknown",
                                 matches,
                                 static_cast<unsigned long>(actor),
-                                static_cast<unsigned long>(skeleton_base_probe));
+                                bone_ok ? "true" : "false",
+                                bone_x, bone_y, bone_z,
+                                detail);
                             append_log(message);
                             ++logged;
                         }
-                        continue;
                     }
 
-                    float bone_x = 0.0f;
-                    float bone_y = 0.0f;
-                    float bone_z = 0.0f;
-                    char detail[512] {};
-                    const bool bone_ok = read_bone_anchor(actor, 2, bone_x, bone_y, bone_z, detail, sizeof(detail));
-                    if (bone_ok) {
-                        ++bone_matches;
-                    }
-                    if (bone_ok || logged < 24) {
-                        char message[1024] {};
-                        std::snprintf(message, sizeof(message),
-                            "boneprobe %s candidate=%d actor=%08lx bone_ok=%s anchor=(%.3f %.3f %.3f) %s",
-                            label ? label : "unknown",
-                            matches,
-                            static_cast<unsigned long>(actor),
-                            bone_ok ? "true" : "false",
-                            bone_x, bone_y, bone_z,
-                            detail);
-                        append_log(message);
-                        ++logged;
-                    }
+#if defined(TARGETLINES_DIAGNOSTIC_BONE_SCAN)
+                    Sleep(1);
+#endif
                 }
             }
 
@@ -1813,6 +2418,11 @@ private:
             logged,
             bone_matches);
         append_log(summary);
+#if defined(TARGETLINES_DIAGNOSTIC_BONE_SCAN)
+        if (diagnostic_bone_probe_cancel_.load()) {
+            append_log("boneprobe target diagnostic scan cancelled");
+        }
+#endif
     }
 
     void probe_actor_identity_near_roots(const char* label, DWORD id, DWORD index, float lua_x, float lua_y, float lua_z) {
@@ -1918,13 +2528,20 @@ private:
     }
 
     int read_lines(LineState* lines, int max_lines) {
+        return read_state(lines, max_lines, nullptr, 0);
+    }
+
+    int read_state(LineState* lines, int max_lines, RingState* rings, int max_rings) {
         if (!state_file_may_have_changed()) {
-            return copy_cached_lines(lines, max_lines);
+            return copy_cached_state(lines, max_lines, rings, max_rings);
         }
 
         WIN32_FILE_ATTRIBUTE_DATA attributes_before {};
         if (!GetFileAttributesExA(state_path_, GetFileExInfoStandard, &attributes_before)) {
             state_cache_valid_ = false;
+            cached_line_count_ = 0;
+            cached_ring_count_ = 0;
+            last_ring_count_ = 0;
             return 0;
         }
 
@@ -1938,12 +2555,12 @@ private:
         if (state_cache_valid_
             && cached_state_write_time_ == write_time_before.QuadPart
             && cached_state_file_size_ == file_size_before) {
-            return copy_cached_lines(lines, max_lines);
+            return copy_cached_state(lines, max_lines, rings, max_rings);
         }
 
         FILE* file = std::fopen(state_path_, "rb");
         if (!file) {
-            return state_cache_valid_ ? copy_cached_lines(lines, max_lines) : 0;
+            return state_cache_valid_ ? copy_cached_state(lines, max_lines, rings, max_rings) : 0;
         }
 
         char buffer[131072] {};
@@ -1958,12 +2575,10 @@ private:
         }
         if (file_size_before >= sizeof(buffer) || content_end == 0 || buffer[0] != '{'
             || buffer[content_end - 1] != '}') {
-            return state_cache_valid_ ? copy_cached_lines(lines, max_lines) : 0;
+            return state_cache_valid_ ? copy_cached_state(lines, max_lines, rings, max_rings) : 0;
         }
 
-        const bool has_lines = std::strstr(buffer, "\"source\"") != nullptr;
-
-        const char* settings = has_lines ? std::strstr(buffer, "\"settings\"") : nullptr;
+        const char* settings = std::strstr(buffer, "\"settings\"");
         if (settings) {
             const float opacity = parse_json_float(settings, "\"opacity\"");
             if (opacity >= 0.0f && opacity <= 1.0f) {
@@ -1989,14 +2604,21 @@ private:
         boneprobe_requested_ = std::strstr(buffer, "\"boneprobe\":true") != nullptr;
 
         LineState parsed_lines[128] {};
+        RingState parsed_rings[max_rings_per_state_] {};
         int count = 0;
         const int render_limit = std::min(max_lines, 16);
-        const char* lines_array = has_lines ? std::strstr(buffer, "\"lines\"") : nullptr;
-        if (lines_array) {
+        const char* lines_array = std::strstr(buffer, "\"lines\"");
+        if (lines && render_limit > 0 && lines_array) {
             count = parse_line_array(lines_array, parsed_lines, render_limit);
         }
 
-        if (count == 0) {
+        int ring_count = 0;
+        const char* rings_array = std::strstr(buffer, "\"rings\"");
+        if (rings_array) {
+            ring_count = parse_ring_array(rings_array, parsed_rings, max_rings_per_state_);
+        }
+
+        if (count == 0 && lines && render_limit > 0) {
             const char* probe_lines_array = std::strstr(buffer, "\"probe_lines\"");
             if (probe_lines_array) {
                 count = parse_line_array(probe_lines_array, parsed_lines, render_limit);
@@ -2006,6 +2628,10 @@ private:
         cached_line_count_ = std::min(count, 128);
         for (int i = 0; i < cached_line_count_; ++i) {
             cached_lines_[i] = parsed_lines[i];
+        }
+        cached_ring_count_ = std::min(ring_count, max_rings_per_state_);
+        for (int i = 0; i < cached_ring_count_; ++i) {
+            cached_rings_[i] = parsed_rings[i];
         }
         state_cache_valid_ = true;
 
@@ -2024,13 +2650,18 @@ private:
             }
         }
 
-        return copy_cached_lines(lines, max_lines);
+        return copy_cached_state(lines, max_lines, rings, max_rings);
     }
 
-    int copy_cached_lines(LineState* lines, int max_lines) const {
-        const int count = std::min(cached_line_count_, max_lines);
+    int copy_cached_state(LineState* lines, int max_lines, RingState* rings, int max_rings) {
+        const int count = lines && max_lines > 0 ? std::min(cached_line_count_, max_lines) : 0;
         for (int i = 0; i < count; ++i) {
             lines[i] = cached_lines_[i];
+        }
+
+        last_ring_count_ = rings && max_rings > 0 ? std::min(cached_ring_count_, max_rings) : 0;
+        for (int i = 0; i < last_ring_count_; ++i) {
+            rings[i] = cached_rings_[i];
         }
         return count;
     }
@@ -2079,6 +2710,8 @@ private:
             line.uid = parse_json_uint(cursor, "\"uid\"");
             line.source_id = parse_json_uint(source, "\"id\"");
             line.source_index = parse_json_uint(source, "\"index\"");
+            line.source_race = parse_json_uint(source, "\"race\"");
+            line.source_model = parse_json_uint(source, "\"model\"");
             line.source_x = parse_json_float(source, "\"x\"");
             line.source_y = parse_json_float(source, "\"y\"");
             line.source_z = parse_json_float(source, "\"z\"");
@@ -2092,6 +2725,8 @@ private:
             line.source_is_npc = parse_json_bool(source, "\"npc\"");
             line.target_id = parse_json_uint(target, "\"id\"");
             line.target_index = parse_json_uint(target, "\"index\"");
+            line.target_race = parse_json_uint(target, "\"race\"");
+            line.target_model = parse_json_uint(target, "\"model\"");
             line.target_x = parse_json_float(target, "\"x\"");
             line.target_y = parse_json_float(target, "\"y\"");
             line.target_z = parse_json_float(target, "\"z\"");
@@ -2114,6 +2749,149 @@ private:
 
             ++count;
             cursor = target + 8;
+        }
+
+        return count;
+    }
+
+    const char* find_json_closing(const char* opening, char open_character, char close_character) const {
+        if (!opening || *opening != open_character) {
+            return nullptr;
+        }
+
+        int depth = 0;
+        bool in_string = false;
+        bool escaped = false;
+        for (const char* cursor = opening; *cursor; ++cursor) {
+            const char character = *cursor;
+            if (in_string) {
+                if (escaped) {
+                    escaped = false;
+                } else if (character == '\\') {
+                    escaped = true;
+                } else if (character == '"') {
+                    in_string = false;
+                }
+                continue;
+            }
+
+            if (character == '"') {
+                in_string = true;
+            } else if (character == open_character) {
+                ++depth;
+            } else if (character == close_character) {
+                // Return the delimiter that closes the original object/array.
+                // Nested point objects and target arrays are skipped by depth.
+                // The state JSON is generated locally, so mismatched delimiters
+                // simply make the current entry unreadable rather than unsafe.
+                //
+                // Keep this parser allocation-free for the render thread.
+                --depth;
+                if (depth == 0) {
+                    return cursor;
+                }
+            }
+        }
+
+        return nullptr;
+    }
+
+    int parse_ring_array(const char* array_start, RingState* rings, int max_rings) {
+        const char* array_open = array_start ? std::strchr(array_start, '[') : nullptr;
+        const char* array_end = find_json_closing(array_open, '[', ']');
+        if (!array_open || !array_end) {
+            return 0;
+        }
+
+        int count = 0;
+        const char* cursor = array_open + 1;
+        while (count < max_rings && cursor < array_end) {
+            const char* object_open = std::strchr(cursor, '{');
+            if (!object_open || object_open >= array_end) {
+                break;
+            }
+
+            const char* object_end = find_json_closing(object_open, '{', '}');
+            if (!object_end || object_end > array_end) {
+                break;
+            }
+
+            const char* center = std::strstr(object_open, "\"center\"");
+            if (!center || center >= object_end) {
+                cursor = object_end + 1;
+                continue;
+            }
+
+            RingState& ring = rings[count];
+            ring.uid = parse_json_uint(object_open, "\"uid\"");
+            ring.center_id = parse_json_uint(center, "\"id\"");
+            ring.center_index = parse_json_uint(center, "\"index\"");
+            ring.center_x = parse_json_float(center, "\"x\"");
+            ring.center_y = parse_json_float(center, "\"y\"");
+            ring.center_z = parse_json_float(center, "\"z\"");
+            ring.center_model_size = parse_json_float(center, "\"model_size\"");
+            ring.center_model_scale = parse_json_float(center, "\"model_scale\"");
+            if (ring.center_model_scale <= 0.0f) {
+                ring.center_model_scale = 1.0f;
+            }
+            ring.center_short_anchor = parse_json_bool(center, "\"short_anchor\"");
+            ring.center_floating_anchor = parse_json_bool(center, "\"floating_anchor\"");
+            ring.center_is_npc = parse_json_bool(center, "\"npc\"");
+            ring.radius = parse_json_float(center, "\"radius\"");
+            ring.color = parse_json_uint(center, "\"color\"");
+            if (ring.color == 0) {
+                ring.color = 0xEFFFFFFF;
+            }
+            ring.timeout = parse_json_float(center, "\"timeout\"");
+            if (ring.timeout <= 0.0f) {
+                ring.timeout = 1.5f;
+            }
+            ring.indicator_style = static_cast<int>(parse_json_uint(object_open, "\"indicator_style\""));
+            if (ring.indicator_style != 1 && ring.indicator_style != 10) {
+                ring.indicator_style = 1;
+            }
+
+            ring.target_count = 0;
+            const char* targets_key = std::strstr(center, "\"targets\"");
+            if (targets_key && targets_key < object_end) {
+                const char* targets_open = std::strchr(targets_key, '[');
+                const char* targets_end = find_json_closing(targets_open, '[', ']');
+                if (targets_open && targets_end && targets_end < object_end) {
+                    const char* target_cursor = targets_open + 1;
+                    while (ring.target_count < max_ring_targets_per_ring_ && target_cursor < targets_end) {
+                        const char* target_open = std::strchr(target_cursor, '{');
+                        if (!target_open || target_open >= targets_end) {
+                            break;
+                        }
+
+                        const char* target_end = find_json_closing(target_open, '{', '}');
+                        if (!target_end || target_end > targets_end) {
+                            break;
+                        }
+
+                        RingTargetState& target = ring.targets[ring.target_count++];
+                        target.id = parse_json_uint(target_open, "\"id\"");
+                        target.index = parse_json_uint(target_open, "\"index\"");
+                        target.race = parse_json_uint(target_open, "\"race\"");
+                        target.model = parse_json_uint(target_open, "\"model\"");
+                        target.x = parse_json_float(target_open, "\"x\"");
+                        target.y = parse_json_float(target_open, "\"y\"");
+                        target.z = parse_json_float(target_open, "\"z\"");
+                        target.model_size = parse_json_float(target_open, "\"model_size\"");
+                        target.model_scale = parse_json_float(target_open, "\"model_scale\"");
+                        if (target.model_scale <= 0.0f) {
+                            target.model_scale = 1.0f;
+                        }
+                        target.short_anchor = parse_json_bool(target_open, "\"short_anchor\"");
+                        target.floating_anchor = parse_json_bool(target_open, "\"floating_anchor\"");
+                        target.is_npc = parse_json_bool(target_open, "\"npc\"");
+                        target_cursor = target_end + 1;
+                    }
+                }
+            }
+
+            ++count;
+            cursor = object_end + 1;
         }
 
         return count;
@@ -2548,6 +3326,7 @@ private:
     char log_path_[1024] {};
     HANDLE state_change_notification_ = INVALID_HANDLE_VALUE;
     unsigned long postrender_calls_ = 0;
+    int last_ring_count_ = 0;
     IDirect3DDevice8* d3d_device_ = nullptr;
     D3DMATRIX cached_view_ {};
     D3DMATRIX cached_projection_ {};
@@ -2576,8 +3355,22 @@ private:
     float width_scale_ = 1.0f;
     float glow_scale_ = 1.0f;
     int dynamic_bone_ = 21;
+    std::uintptr_t cached_mob_array_ = 0;
+    std::uintptr_t cached_mob_array_module_base_ = 0;
+    std::uintptr_t cached_mob_array_signature_ = 0;
+    DWORD next_mob_array_resolve_ms_ = 0;
+#if defined(TARGETLINES_DIAGNOSTIC_BONE_SCAN)
+    HANDLE diagnostic_bone_probe_thread_ = nullptr;
+    std::atomic<bool> diagnostic_bone_probe_running_ {false};
+    std::atomic<bool> diagnostic_bone_probe_cancel_ {false};
+    float diagnostic_probe_x_ = 0.0f;
+    float diagnostic_probe_y_ = 0.0f;
+    float diagnostic_probe_z_ = 0.0f;
+#endif
     LineState cached_lines_[128] {};
     int cached_line_count_ = 0;
+    RingState cached_rings_[max_rings_per_state_] {};
+    int cached_ring_count_ = 0;
     unsigned long long cached_state_write_time_ = 0;
     unsigned long long cached_state_file_size_ = 0;
     bool state_cache_valid_ = false;
@@ -2593,6 +3386,9 @@ private:
     static constexpr int max_active_lines_ = 128;
     ActiveLine active_lines_[max_active_lines_] {};
     int active_line_count_ = 0;
+    static constexpr int max_active_rings_ = 32;
+    ActiveRing active_rings_[max_active_rings_] {};
+    int active_ring_count_ = 0;
 };
 
 std::uint32_t GetInterfaceVersion() {

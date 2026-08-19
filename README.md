@@ -128,7 +128,7 @@ By default:
 
 - Regular attacks draw once per source-target pair.
 - Spells, job abilities, weapon skills, monster TP moves, and pet/avatar actions draw as they happen.
-- AoE fan-out lines are dimmed to reduce clutter.
+- Area actions use Ring (A); Fan, Ring (B), and Off remain selectable.
 
 
 
@@ -170,14 +170,14 @@ The settings panel includes:
 > - `Enemy Lines` _// enemy-origin action lines_
 > - `Other Party Lines` _// lines unrelated to your party_
 > - `Abilities/Spells` _// spells, weapon skills, abilities, and TP moves_
-> - `AoE Fan Lines` _// extra target lines for area actions_
+> - `AoE Style` _// fan-out lines, Ring (A) comet markers, Ring (B) contracting markers, or off_
 > - `Color Blind Mode` _// alternate color palette_
 > - `Line Width` _// line thickness preset_
 > - `Player Opacity` _// opacity for player-origin lines_
 > - `Ally Opacity` _// opacity for party, trust, and pet lines_
 > - `Enemy Opacity` _// opacity for enemy-origin lines_
 > - `Line Duration` _// how long action lines remain visible_
-> - `AoE Fan Opacity` _// opacity for area-action fan-out lines_
+> - `AoE Opacity` _// opacity for the selected area-action indicator style_
 > - `Regular Attacks` _// first hit, delayed repeats, or off_
 
 `Enable Lines` is the master display toggle. The individual line toggles keep
@@ -200,7 +200,8 @@ additional commands, including debug commands.
 //tl enemylines [on|off]        Toggle enemy-origin lines.
 //tl otherpartylines [on|off]   Toggle lines unrelated to your party/trusts/pets.
 //tl speciallines [on|off]      Toggle abilities/spells/weapon skills/TP moves.
-//tl fanlines [on|off]          Toggle AoE fan-out lines.
+//tl aoemode off|fan|ring1|ring2 Select the AoE indicator presentation.
+//tl aoeopacity <0.1-1.25>|+|- Adjust opacity for the selected AoE style.
 //tl colorblind [on|off]        Toggle color blind mode.
 //tl regular first|repeat|off   Configure regular attack lines.
 //tl playeropacity +|-          Adjust player line opacity.
@@ -208,7 +209,6 @@ additional commands, including debug commands.
 //tl enemyopacity +|-           Adjust enemy line opacity.
 //tl width +|-                  Adjust line width.
 //tl fade +|-                   Adjust line duration.
-//tl fanopacity +|-             Adjust AoE fan-out opacity.
 //tl clear                      Clear active lines and first-attack memory.
 //tl status                     Print status and write status to runtime log.
 //tl inspect                    Write an inspect snapshot to inspect.log.
@@ -229,11 +229,17 @@ additional commands, including debug commands.
 //tl specialcooldown <seconds>  Set special action repeat delay.
 //tl claim [on|off]             Toggle claim-based fallback lines.
 //tl autoinspect interval <sec> Set auto inspect interval, minimum 30 seconds.
+//tl fanlines [on|off]          Legacy compatibility toggle; prefer aoemode.
 //tl actiondebug [on|off]       Toggle action packet debug logging.
 //tl boneprobe                  Request native anchor probe for latest line.
 //tl luamobprobe                Run the native LuaCore mob/bone diagnostic probe.
-//tl dynamicbone <auto|off|0-255> Control the native dynamic bone anchor; auto uses bone 21.
+//tl dynamicbone <auto|off|0-255> Control the native dynamic bone anchor; auto uses bone 21, with bone 39 for Mithra NPCs/trusts and verified trust-model exceptions.
 ```
+
+The bone 39 exceptions are provisional. Their positional differences may be
+caused by model animation or weapon stance rather than skeleton identity alone,
+so the automatic anchor mapping may need further investigation as more models
+and animations are tested.
 
 `//tl claim on` enables an experimental fallback for missed actions. It infers
 temporary lines from nearby claimed enemies instead of action packets, and is
@@ -274,5 +280,10 @@ TargetLines creates local user-specific files as needed:
   the addon and plugin.
 
 These files are generated locally and are intentionally ignored by Git.
+
+Settings from earlier releases migrate automatically. `aoe_mode` and
+`aoe_opacity_scale` are the authoritative v1.1 settings. The legacy XML keys
+`show_fan_lines`, `fan_opacity_scale`, and `ring_indicator_style` are retained
+only for migration compatibility and should not be edited directly.
 
 </details>

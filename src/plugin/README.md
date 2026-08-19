@@ -19,7 +19,7 @@ README.md           Native plugin development notes.
 From the repository root:
 
 ```powershell
-mingw32 -c "g++ -shared -static -static-libgcc -static-libstdc++ -std=c++17 -Wall -Wextra -Wpedantic -m32 -DWIN32_LEAN_AND_MEAN -o plugins/TargetLines.dll src/plugin/TargetLines.cpp src/plugin/exports.def -ld3d8"
+mingw32 -c "g++ -shared -static -static-libgcc -static-libstdc++ -std=c++17 -Wall -Wextra -Wpedantic -m32 -o plugins/TargetLines.dll src/plugin/TargetLines.cpp src/plugin/exports.def -ld3d8"
 ```
 
 The command above writes the rebuilt DLL to the repository copy:
