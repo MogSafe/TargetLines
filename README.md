@@ -152,6 +152,24 @@ Color blind mode uses:
 - Vermilion: enemy actions.
 - Magenta/pink: NPC-to-NPC/enemy-to-enemy actions.
 
+
+ ## AoE Indicators
+
+Area of effect visualization for affected targets of supported AoE spells,
+abilities, and monster actions.
+
+<img width="720" height="405" alt="aoe_ring_a_ally" src="https://github.com/user-attachments/assets/df6ef290-403e-48aa-adeb-0f6d849834e3" />
+
+Styles can be chosen from `AoE Style` in `//tl config`:
+
+- **Ring (A)** — expanding AoE ring with orbiting line target indicators.
+- **Ring (B)** — expanding AoE footprint with contracting ring target indicators.
+- **Fan** — fan-out lines drawn from the action center to each affected target.
+- **Off** — disables AoE indicators without disabling regular target lines.
+
+*Ring (A)* is selected by default on new installations.
+
+
 ## Settings
 
 Open or close the settings panel:
@@ -170,7 +188,7 @@ The settings panel includes:
 > - `Enemy Lines` _// enemy-origin action lines_
 > - `Other Party Lines` _// lines unrelated to your party_
 > - `Abilities/Spells` _// spells, weapon skills, abilities, and TP moves_
-> - `AoE Style` _// fan-out lines, Ring (A) comet markers, Ring (B) contracting markers, or off_
+> - `AoE Style` _// fan-out lines, Ring (A) orbiting line markers, Ring (B) contracting markers, or off_
 > - `Color Blind Mode` _// alternate color palette_
 > - `Line Width` _// line thickness preset_
 > - `Player Opacity` _// opacity for player-origin lines_
