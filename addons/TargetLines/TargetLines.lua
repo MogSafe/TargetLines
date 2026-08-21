@@ -140,7 +140,18 @@ config_box:hide()
 local config_visible = false
 
 local state_dir = windower.windower_path .. 'plugins/settings/TargetLines'
-local state_path = state_dir .. '/lines.json'
+local state_instances_dir = state_dir .. '/instances'
+local state_identifier = nil
+local state_path = nil
+local state_bound = false
+local state_status = 'waiting_for_character'
+local state_last_error = ''
+local state_last_route_attempt = -1
+local state_last_route_command = -1
+local state_last_warning = -30
+local state_route_retry_interval = 1.0
+local state_route_refresh_interval = 5.0
+local state_warning_interval = 30.0
 local inspect_path = windower.addon_path .. 'inspect.log'
 local runtime_log_path = windower.addon_path .. 'runtime.log'
 local last_write = 0
@@ -190,11 +201,26 @@ local native_probe_commands = {
     drawoff = true,
 }
 
-local function ensure_state_dir()
-    if type(windower.create_dir) == 'function' then
-        windower.create_dir(windower.windower_path .. 'plugins/settings')
-        windower.create_dir(state_dir)
+local function ensure_state_dirs()
+    if type(windower.create_dir) ~= 'function' or type(windower.dir_exists) ~= 'function' then
+        return false, 'Windower directory functions are unavailable'
     end
+
+    local paths = {
+        windower.windower_path .. 'plugins/settings',
+        state_dir,
+        state_instances_dir,
+    }
+    for _, path in ipairs(paths) do
+        if not windower.dir_exists(path) then
+            local created, error_message = windower.create_dir(path)
+            if not created and not windower.dir_exists(path) then
+                return false, error_message or ('Could not create ' .. path)
+            end
+        end
+    end
+
+    return true
 end
 
 local slider_rows = {
@@ -1902,22 +1928,175 @@ local function encode_state(lines, rings)
     return '{' .. table.concat(parts) .. '\n'
 end
 
+local function sanitize_state_component(value)
+    value = tostring(value or ''):gsub('[^%w_-]', '_'):gsub('_+', '_')
+    value = value:gsub('^_+', ''):gsub('_+$', '')
+    return value:sub(1, 48)
+end
+
+local function current_state_identifier()
+    local player = windower.ffxi.get_player()
+    local info = windower.ffxi.get_info() or {}
+    local server_id = tonumber(info.server) or 0
+    local character = sanitize_state_component(player and player.name)
+    if info.logged_in ~= true or server_id <= 0 or character == '' then
+        return nil
+    end
+
+    local server = resources.servers and resources.servers[server_id]
+    local server_name = sanitize_state_component(server and (server.en or server.name) or server_id)
+    if server_name == '' then
+        server_name = tostring(server_id)
+    end
+    return server_name .. '-' .. character
+end
+
+local function write_state_contents(path, contents)
+    local file, open_error = io.open(path, 'w')
+    if not file then
+        return false, open_error or 'could not open file for writing'
+    end
+
+    local write_ok, write_result, write_error = pcall(file.write, file, contents)
+    local close_ok, close_result, close_error = pcall(file.close, file)
+    if not write_ok then
+        return false, tostring(write_result)
+    end
+    if not write_result then
+        return false, write_error or 'file write failed'
+    end
+    if not close_ok then
+        return false, tostring(close_result)
+    end
+    if not close_result then
+        return false, close_error or 'file close failed'
+    end
+
+    return true
+end
+
+local function report_state_error(message, now)
+    now = now or os.clock()
+    state_status = 'error'
+    state_last_error = tostring(message or 'unknown state error')
+    if now - state_last_warning >= state_warning_interval then
+        state_last_warning = now
+        warning('TargetLines state routing: ' .. state_last_error)
+        if append_runtime_log then
+            append_runtime_log('state routing error: ' .. state_last_error)
+        end
+    end
+end
+
+local function send_state_route(identifier)
+    windower.send_command('targetlines statefile ' .. (identifier or 'off'))
+    state_last_route_command = os.clock()
+end
+
+local function release_state_route(remove_file)
+    local old_path = state_path
+    if old_path then
+        write_state_contents(old_path, encode_state({}, {}))
+    end
+    send_state_route(nil)
+    if remove_file and old_path then
+        os.remove(old_path)
+    end
+
+    state_identifier = nil
+    state_path = nil
+    state_bound = false
+    state_status = 'waiting_for_character'
+    state_last_error = ''
+    state_last_route_attempt = -1
+    last_signature = ''
+end
+
+local function maintain_state_route(now, force)
+    now = now or os.clock()
+    local identifier = current_state_identifier()
+    if not identifier then
+        if state_identifier then
+            release_state_route(true)
+        else
+            state_status = 'waiting_for_character'
+        end
+        return false
+    end
+
+    if identifier ~= state_identifier then
+        if state_identifier then
+            release_state_route(true)
+        end
+        state_identifier = identifier
+        state_path = state_instances_dir .. '/' .. identifier .. '.json'
+        state_bound = false
+        state_status = 'initializing'
+        state_last_error = ''
+        state_last_route_attempt = -1
+        last_signature = ''
+    end
+
+    if not state_bound then
+        if not force and state_last_route_attempt >= 0
+            and now - state_last_route_attempt < state_route_retry_interval then
+            return false
+        end
+
+        state_last_route_attempt = now
+        local dirs_ok, dir_error = ensure_state_dirs()
+        if not dirs_ok then
+            report_state_error(dir_error, now)
+            return false
+        end
+
+        local empty_state = encode_state({}, {})
+        local write_ok, write_error = write_state_contents(state_path, empty_state)
+        if not write_ok then
+            report_state_error(('Could not initialize %s: %s'):format(state_path, tostring(write_error)), now)
+            return false
+        end
+
+        last_signature = empty_state
+        send_state_route(state_identifier)
+        state_bound = true
+        state_status = 'bound'
+        state_last_error = ''
+        if append_runtime_log then
+            append_runtime_log('state route bound identifier=' .. state_identifier .. ' path=' .. state_path)
+        end
+        return true
+    end
+
+    if force or state_last_route_command < 0
+        or now - state_last_route_command >= state_route_refresh_interval then
+        send_state_route(state_identifier)
+    end
+    return true
+end
+
 local function write_state(lines, rings)
+    if not state_bound or not state_path then
+        return false
+    end
+
     local state = encode_state(lines, rings)
     if state == last_signature then
-        return
+        return true
     end
 
-    ensure_state_dir()
-    local file = io.open(state_path, 'w')
-    if not file then
-        warning('Could not write ' .. state_path)
-        return
+    local write_ok, write_error = write_state_contents(state_path, state)
+    if not write_ok then
+        report_state_error(('Could not write %s: %s'):format(state_path, tostring(write_error)))
+        send_state_route(nil)
+        state_bound = false
+        state_last_route_attempt = os.clock()
+        last_signature = ''
+        return false
     end
 
-    file:write(state)
-    file:close()
     last_signature = state
+    return true
 end
 
 local function update_debug(lines)
@@ -1949,12 +2128,17 @@ windower.register_event('incoming chunk', function(id, data)
 end)
 
 windower.register_event('prerender', function()
+    local now = os.clock()
+    local route_ready = maintain_state_route(now, false)
     if not settings.enabled then
         box:hide()
         return
     end
+    if not route_ready then
+        box:hide()
+        return
+    end
 
-    local now = os.clock()
     if now - last_write < (tonumber(settings.write_interval) or defaults.write_interval) then
         return
     end
@@ -1983,8 +2167,38 @@ windower.register_event('prerender', function()
 end)
 
 windower.register_event('load', function()
-    ensure_state_dir()
-    append_runtime_log('loaded enabled=' .. tostring(settings.enabled) .. ' debug=' .. tostring(settings.debug))
+    send_state_route(nil)
+    maintain_state_route(os.clock(), true)
+    append_runtime_log(('loaded enabled=%s debug=%s state_route=%s state_id=%s')
+        :format(tostring(settings.enabled), tostring(settings.debug), state_status, tostring(state_identifier or 'none')))
+end)
+
+windower.register_event('login', function()
+    send_state_route(nil)
+    maintain_state_route(os.clock(), true)
+end)
+
+windower.register_event('logout', function()
+    release_state_route(true)
+end)
+
+windower.register_event('zone change', function()
+    recent_lines = {}
+    recent_rings = {}
+    seen_pairs = {}
+    seen_special_pairs = {}
+    recent_spell_starts = {}
+    recent_spell_events = {}
+    recent_ability_starts = {}
+    recent_action_casts = {}
+    probe_lines = {}
+    last_lines = {}
+    last_nearby = {}
+    next_line_expiration = 0
+    last_signature = ''
+    if state_bound then
+        write_state({}, {})
+    end
 end)
 
 windower.register_event('addon command', function(command, ...)
@@ -2310,7 +2524,7 @@ windower.register_event('addon command', function(command, ...)
         append_runtime_log('boneprobe flag written for latest line')
         log('TargetLines bone probe requested for latest line.')
     elseif command == 'status' then
-        log(('enabled=%s debug=%s action_debug=%s player=%s party=%s pet=%s enemy=%s other_party=%s special=%s aoe_mode=%s color_blind=%s range=%s global_opacity=%s player_opacity=%s ally_opacity=%s enemy_opacity=%s aoe_opacity=%s fade=%s width=%s glow=%s source_height=%s target_height=%s interval=%s regular=%s repeat_delay=%s special_cooldown=%s claim=%s auto_inspect=%s auto_interval=%s state=%s lines=%s nearby=%s')
+        log(('enabled=%s debug=%s action_debug=%s player=%s party=%s pet=%s enemy=%s other_party=%s special=%s aoe_mode=%s color_blind=%s range=%s global_opacity=%s player_opacity=%s ally_opacity=%s enemy_opacity=%s aoe_opacity=%s fade=%s width=%s glow=%s source_height=%s target_height=%s interval=%s regular=%s repeat_delay=%s special_cooldown=%s claim=%s auto_inspect=%s auto_interval=%s state_route=%s state_id=%s state=%s state_error=%s lines=%s nearby=%s')
             :format(tostring(settings.enabled), tostring(settings.debug), tostring(settings.action_debug),
                 tostring(settings.show_player_lines ~= false), tostring(settings.show_party_lines ~= false),
                 tostring(settings.show_pet_lines ~= false), tostring(settings.show_enemy_lines ~= false),
@@ -2327,8 +2541,10 @@ windower.register_event('addon command', function(command, ...)
                 tostring(settings.write_interval), regular_mode(),
                 tostring(settings.pair_cooldown), tostring(settings.special_cooldown), tostring(settings.claim_fallback),
                 tostring(settings.auto_inspect == true), tostring(tonumber(settings.auto_inspect_interval) or defaults.auto_inspect_interval),
-                state_path, tostring(#last_lines), tostring(#last_nearby)))
-        append_runtime_log(('status enabled=%s debug=%s action_debug=%s player=%s party=%s pet=%s enemy=%s other_party=%s special=%s aoe_mode=%s color_blind=%s range=%s global_opacity=%s player_opacity=%s ally_opacity=%s enemy_opacity=%s aoe_opacity=%s fade=%s width=%s glow=%s source_height=%s target_height=%s interval=%s regular=%s repeat_delay=%s special_cooldown=%s claim=%s auto_inspect=%s auto_interval=%s lines=%s nearby=%s')
+                state_status, tostring(state_identifier or 'none'), tostring(state_path or 'none'),
+                tostring(state_last_error ~= '' and state_last_error or 'none'),
+                tostring(#last_lines), tostring(#last_nearby)))
+        append_runtime_log(('status enabled=%s debug=%s action_debug=%s player=%s party=%s pet=%s enemy=%s other_party=%s special=%s aoe_mode=%s color_blind=%s range=%s global_opacity=%s player_opacity=%s ally_opacity=%s enemy_opacity=%s aoe_opacity=%s fade=%s width=%s glow=%s source_height=%s target_height=%s interval=%s regular=%s repeat_delay=%s special_cooldown=%s claim=%s auto_inspect=%s auto_interval=%s state_route=%s state_id=%s state=%s state_error=%s lines=%s nearby=%s')
             :format(tostring(settings.enabled), tostring(settings.debug), tostring(settings.action_debug),
                 tostring(settings.show_player_lines ~= false), tostring(settings.show_party_lines ~= false),
                 tostring(settings.show_pet_lines ~= false), tostring(settings.show_enemy_lines ~= false),
@@ -2345,6 +2561,8 @@ windower.register_event('addon command', function(command, ...)
                 tostring(settings.write_interval), regular_mode(),
                 tostring(settings.pair_cooldown), tostring(settings.special_cooldown), tostring(settings.claim_fallback),
                 tostring(settings.auto_inspect == true), tostring(tonumber(settings.auto_inspect_interval) or defaults.auto_inspect_interval),
+                state_status, tostring(state_identifier or 'none'), tostring(state_path or 'none'),
+                tostring(state_last_error ~= '' and state_last_error or 'none'),
                 tostring(#last_lines), tostring(#last_nearby)))
     elseif command == 'inspect' or command == 'i' then
         if write_inspect_log('manual') then
@@ -2368,6 +2586,7 @@ windower.register_event('mouse', function(type, x, y, delta, blocked)
 end)
 
 windower.register_event('unload', function()
+    release_state_route(true)
     box:hide()
     config_box:hide()
 end)

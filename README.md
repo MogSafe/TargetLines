@@ -112,11 +112,15 @@ Windower\plugins\settings\TargetLines
 ## Features
 
 TargetLines watches action packets and writes recent source-to-target line
-events to:
+events to a server/character-specific runtime file, for example:
 
 ```text
-plugins/settings/TargetLines/lines.json
+plugins/settings/TargetLines/instances/Asura-MogSafe.json
 ```
+
+Each game client reads only its own character file. This prevents concurrent
+clients using the same Windower installation from replacing one another's line
+state while multiboxing.
 
 <img width="480" height="270" alt="TLW-fight1_rotate_small" src="https://github.com/user-attachments/assets/eb3c25ad-8caf-4efb-a81c-1d76ea311f04" />
 
@@ -294,10 +298,15 @@ References:
 TargetLines creates local user-specific files as needed:
 
 - `addons/TargetLines/data/settings.xml` stores saved addon settings.
-- `plugins/settings/TargetLines/lines.json` is the runtime state file used by
-  the addon and plugin.
+- `plugins/settings/TargetLines/instances/<server>-<character>.json` is the
+  transient runtime state file used by the addon and plugin. One file is used
+  per server/character so multiple game clients remain isolated.
 
 These files are generated locally and are intentionally ignored by Git.
+
+The active character file is cleared before the native plugin binds to it and
+is normally removed on logout or addon unload. A file left behind by a crash is
+safe: the next login overwrites it with empty state before rendering begins.
 
 Settings from earlier releases migrate automatically. `aoe_mode` and
 `aoe_opacity_scale` are the authoritative v1.1 settings. The legacy XML keys
