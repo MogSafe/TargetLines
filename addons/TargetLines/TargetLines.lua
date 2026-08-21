@@ -154,6 +154,8 @@ local state_route_refresh_interval = 5.0
 local state_warning_interval = 30.0
 local inspect_path = windower.addon_path .. 'inspect.log'
 local runtime_log_path = windower.addon_path .. 'runtime.log'
+local runtime_log_backup_path = runtime_log_path .. '.1'
+local runtime_log_max_size = 5 * 1024 * 1024
 local last_write = 0
 local last_signature = ''
 local last_state_maintenance = 0
@@ -1509,14 +1511,37 @@ local function describe_mob(mob)
             tostring(target and target.name), tostring(target and target.id), tostring(mob.claim_id))
 end
 
-append_runtime_log = function(line)
-    local file = io.open(runtime_log_path, 'a')
+local function rotate_runtime_log_if_needed(incoming_size)
+    local file = io.open(runtime_log_path, 'rb')
     if not file then
         return
     end
 
-    file:write(os.date('%Y-%m-%d %H:%M:%S') .. ' ' .. tostring(line) .. '\n')
+    local current_size = file:seek('end') or 0
     file:close()
+    if current_size + incoming_size <= runtime_log_max_size then
+        return
+    end
+
+    -- Rotation is best-effort because multibox clients can reach this point
+    -- simultaneously. A failed rename leaves the active log intact and a
+    -- later write will retry without affecting addon behavior.
+    os.remove(runtime_log_backup_path)
+    os.rename(runtime_log_path, runtime_log_backup_path)
+end
+
+append_runtime_log = function(line)
+    local entry = os.date('%Y-%m-%d %H:%M:%S') .. ' ' .. tostring(line) .. '\n'
+    rotate_runtime_log_if_needed(#entry)
+
+    local file = io.open(runtime_log_path, 'a')
+    if not file then
+        return false
+    end
+
+    local written = file:write(entry)
+    file:close()
+    return written ~= nil
 end
 
 local function debug_value(value)
