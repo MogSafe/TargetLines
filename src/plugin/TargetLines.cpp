@@ -101,12 +101,14 @@ public:
         if (!command || std::strcmp(command, "status") == 0) {
             char message[1024] {};
             std::snprintf(message, sizeof(message),
-                "status: enabled=%s debug_bar=%s source_height=%.3f target_height=%.3f dynamic_bone=%d lines=%d projection=d3d-matrix-3dbezier",
+                "status: enabled=%s debug_bar=%s source_height=%.3f target_height=%.3f dynamic_bone=%d state_bound=%s state_id=%s lines=%d projection=d3d-matrix-3dbezier",
                 overlay_enabled_ ? "true" : "false",
                 debug_bar_enabled_ ? "true" : "false",
                 source_height_offset_,
                 target_height_offset_,
                 dynamic_bone_,
+                state_bound_ ? "true" : "false",
+                state_bound_ ? state_identifier_ : "none",
                 count_lines());
             append_log(message);
             return;
@@ -121,8 +123,38 @@ public:
 
         if (std::strcmp(command, "path") == 0) {
             char message[1024] {};
-            std::snprintf(message, sizeof(message), "state=%s log=%s", state_path_, log_path_);
+            std::snprintf(message, sizeof(message), "state_bound=%s state_id=%s state=%s log=%s",
+                state_bound_ ? "true" : "false",
+                state_bound_ ? state_identifier_ : "none",
+                state_bound_ ? state_path_ : "none",
+                log_path_);
             append_log(message);
+            return;
+        }
+
+        if (std::strncmp(command, "statefile", 9) == 0 &&
+            (command[9] == '\0' || command[9] == ' ')) {
+            const char* value = command + 9;
+            while (*value == ' ') {
+                ++value;
+            }
+
+            if (*value == '\0') {
+                char message[1024] {};
+                std::snprintf(message, sizeof(message), "statefile bound=%s id=%s path=%s",
+                    state_bound_ ? "true" : "false",
+                    state_bound_ ? state_identifier_ : "none",
+                    state_bound_ ? state_path_ : "none");
+                append_log(message);
+                return;
+            }
+
+            if (std::strcmp(value, "off") == 0 || std::strcmp(value, "none") == 0) {
+                unbind_state_file("command");
+                return;
+            }
+
+            bind_state_file(value);
             return;
         }
 
@@ -2532,6 +2564,10 @@ private:
     }
 
     int read_state(LineState* lines, int max_lines, RingState* rings, int max_rings) {
+        if (!state_bound_ || state_path_[0] == '\0') {
+            last_ring_count_ = 0;
+            return 0;
+        }
         if (!state_file_may_have_changed()) {
             return copy_cached_state(lines, max_lines, rings, max_rings);
         }
@@ -3240,6 +3276,127 @@ private:
         }
     }
 
+    bool ensure_directory_exists(const char* path) {
+        if (!path || path[0] == '\0') {
+            return false;
+        }
+        if (CreateDirectoryA(path, nullptr)) {
+            return true;
+        }
+
+        const DWORD error = GetLastError();
+        if (error != ERROR_ALREADY_EXISTS) {
+            return false;
+        }
+
+        const DWORD attributes = GetFileAttributesA(path);
+        return attributes != INVALID_FILE_ATTRIBUTES &&
+            (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    }
+
+    bool valid_state_identifier(const char* identifier) const {
+        if (!identifier || identifier[0] == '\0') {
+            return false;
+        }
+
+        constexpr std::size_t max_identifier_length = 96;
+        std::size_t length = 0;
+        for (const unsigned char* cursor = reinterpret_cast<const unsigned char*>(identifier);
+            *cursor != '\0'; ++cursor) {
+            ++length;
+            if (length > max_identifier_length) {
+                return false;
+            }
+            const bool allowed = (*cursor >= 'a' && *cursor <= 'z') ||
+                (*cursor >= 'A' && *cursor <= 'Z') ||
+                (*cursor >= '0' && *cursor <= '9') ||
+                *cursor == '-' || *cursor == '_';
+            if (!allowed) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void reset_state_runtime() {
+        cached_line_count_ = 0;
+        cached_ring_count_ = 0;
+        cached_state_write_time_ = 0;
+        cached_state_file_size_ = 0;
+        state_cache_valid_ = false;
+        last_ring_count_ = 0;
+        active_line_count_ = 0;
+        active_ring_count_ = 0;
+        anchor_cache_count_ = 0;
+    }
+
+    void open_state_change_notification() {
+        close_state_change_notification();
+        if (!state_bound_ || instances_path_[0] == '\0') {
+            return;
+        }
+
+        state_change_notification_ = FindFirstChangeNotificationA(
+            instances_path_,
+            FALSE,
+            FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE);
+        if (state_change_notification_ == INVALID_HANDLE_VALUE) {
+            append_log("statefile change notifications unavailable; using polling fallback");
+        }
+    }
+
+    void unbind_state_file(const char* reason) {
+        const bool was_bound = state_bound_;
+        close_state_change_notification();
+        reset_state_runtime();
+        state_bound_ = false;
+        state_identifier_[0] = '\0';
+        state_path_[0] = '\0';
+        if (was_bound) {
+            char message[256] {};
+            std::snprintf(message, sizeof(message), "statefile unbound reason=%s", reason ? reason : "unknown");
+            append_log(message);
+        }
+    }
+
+    bool bind_state_file(const char* identifier) {
+        if (!valid_state_identifier(identifier)) {
+            append_log("statefile rejected invalid identifier");
+            return false;
+        }
+        if (!ensure_directory_exists(instances_path_)) {
+            append_log("statefile instances directory unavailable");
+            return false;
+        }
+        if (state_bound_ && std::strcmp(state_identifier_, identifier) == 0) {
+            if (state_change_notification_ == INVALID_HANDLE_VALUE) {
+                open_state_change_notification();
+            }
+            return true;
+        }
+
+        char candidate_path[1024] {};
+        const int written = std::snprintf(candidate_path, sizeof(candidate_path),
+            "%s\\%s.json", instances_path_, identifier);
+        if (written <= 0 || static_cast<std::size_t>(written) >= sizeof(candidate_path)) {
+            append_log("statefile path is too long");
+            return false;
+        }
+
+        close_state_change_notification();
+        reset_state_runtime();
+        std::snprintf(state_identifier_, sizeof(state_identifier_), "%s", identifier);
+        std::snprintf(state_path_, sizeof(state_path_), "%s", candidate_path);
+        state_bound_ = true;
+        open_state_change_notification();
+
+        char message[1024] {};
+        std::snprintf(message, sizeof(message), "statefile bound id=%s path=%s",
+            state_identifier_, state_path_);
+        append_log(message);
+        return true;
+    }
+
     void initialize_paths_from_module() {
         char module_path[MAX_PATH] {};
         if (!g_module || !GetModuleFileNameA(g_module, module_path, sizeof(module_path))) {
@@ -3252,17 +3409,23 @@ private:
         }
 
         *slash = '\0';
-        char settings_root[MAX_PATH] {};
-        std::snprintf(settings_root, sizeof(settings_root), "%s\\settings", module_path);
-        CreateDirectoryA(settings_root, nullptr);
-        std::snprintf(settings_root, sizeof(settings_root), "%s\\settings\\TargetLines", module_path);
-        CreateDirectoryA(settings_root, nullptr);
-        std::snprintf(log_path_, sizeof(log_path_), "%s\\settings\\TargetLines\\native.log", module_path);
-        std::snprintf(state_path_, sizeof(state_path_), "%s\\settings\\TargetLines\\lines.json", module_path);
-        state_change_notification_ = FindFirstChangeNotificationA(
-            settings_root,
-            FALSE,
-            FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE);
+        char settings_parent[1024] {};
+        std::snprintf(settings_parent, sizeof(settings_parent), "%s\\settings", module_path);
+        std::snprintf(settings_root_path_, sizeof(settings_root_path_), "%s\\TargetLines", settings_parent);
+        std::snprintf(instances_path_, sizeof(instances_path_), "%s\\instances", settings_root_path_);
+
+        const bool parent_ok = ensure_directory_exists(settings_parent);
+        const bool root_ok = parent_ok && ensure_directory_exists(settings_root_path_);
+        const bool instances_ok = root_ok && ensure_directory_exists(instances_path_);
+        if (!instances_ok) {
+            append_module_log("TargetLines state directories could not be created");
+        }
+
+        std::snprintf(log_path_, sizeof(log_path_), "%s\\native.log", settings_root_path_);
+        state_identifier_[0] = '\0';
+        state_path_[0] = '\0';
+        state_bound_ = false;
+        reset_state_runtime();
     }
 
     void close_state_change_notification() {
@@ -3296,6 +3459,9 @@ private:
     }
 
     int count_lines() {
+        if (!state_bound_ || state_path_[0] == '\0') {
+            return 0;
+        }
         FILE* file = std::fopen(state_path_, "rb");
         if (!file) {
             return -static_cast<int>(errno);
@@ -3322,8 +3488,12 @@ private:
         std::fclose(file);
         return count;
     }
+    char settings_root_path_[1024] {};
+    char instances_path_[1024] {};
+    char state_identifier_[128] {};
     char state_path_[1024] {};
     char log_path_[1024] {};
+    bool state_bound_ = false;
     HANDLE state_change_notification_ = INVALID_HANDLE_VALUE;
     unsigned long postrender_calls_ = 0;
     int last_ring_count_ = 0;

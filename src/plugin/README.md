@@ -1,8 +1,10 @@
 # TargetLines Native Plugin
 
 This folder contains the native Windower plugin used by TargetLines. The Lua
-addon writes line state to `plugins/settings/TargetLines/lines.json`; this
-plugin reads that state and renders the lines with D3D8 (Direct3D 8).
+addon writes line state to a server/character file under
+`plugins/settings/TargetLines/instances`; this plugin binds to that file and
+renders the lines with D3D8 (Direct3D 8). Per-character routing keeps multiple
+game clients using the same Windower installation isolated from one another.
 
 ## Files
 
@@ -62,6 +64,9 @@ plugins/settings/TargetLines/native.log
 
 ```text
 //targetlines status
+//targetlines path
+//targetlines statefile <server-character>
+//targetlines statefile off
 //targetlines drawon
 //targetlines drawoff
 //targetlines drawtest
@@ -73,3 +78,6 @@ plugins/settings/TargetLines/native.log
 //targetlines ffxiprobe
 //targetlines luamobprobe
 ```
+
+`statefile` is normally managed by the Lua addon. It accepts an identifier,
+not an arbitrary path, and is exposed for diagnostics and isolation testing.
