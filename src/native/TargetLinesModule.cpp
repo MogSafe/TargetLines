@@ -23,7 +23,7 @@ using fn_pushstring = void(__cdecl*)(lua_State*, char const*);
 using fn_tolstring = char const*(__cdecl*)(lua_State*, int, std::size_t*);
 
 constexpr int kGlobalsIndex = -10002;
-constexpr char kModuleVersion[] = "2.0.0-dev";
+constexpr char kModuleVersion[] = "2.0.0";
 constexpr std::size_t kStateCapacity = 131072;
 
 struct LuaApi {
