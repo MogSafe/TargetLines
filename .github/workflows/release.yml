@@ -1,0 +1,158 @@
+name: Build TargetLines release
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Build and package 32-bit addon
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install 32-bit MinGW toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW32
+          update: true
+          install: >-
+            mingw-w64-i686-gcc
+            mingw-w64-i686-binutils
+
+      - name: Build installable addon
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+
+          package_dir='build/github-release/TargetLines'
+          rm -rf 'build/github-release'
+          mkdir -p "${package_dir}/libs"
+
+          g++ \
+            -shared \
+            -static \
+            -static-libgcc \
+            -static-libstdc++ \
+            -std=c++17 \
+            -Wall \
+            -Wextra \
+            -Wpedantic \
+            -Werror \
+            -m32 \
+            -Isrc/native \
+            -o "${package_dir}/libs/_TargetLines.dll" \
+            src/native/TargetLinesModule.cpp \
+            src/native/TargetLinesRenderer.cpp \
+            src/native/exports.def \
+            -ld3d8
+
+          cp addons/TargetLines/TargetLines.lua "${package_dir}/"
+          cp addons/TargetLines/LICENSE.md "${package_dir}/"
+          cp addons/TargetLines/THIRD_PARTY_NOTICES.md "${package_dir}/"
+
+      - name: Validate native module and package contents
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+
+          package_dir='build/github-release/TargetLines'
+          module="${package_dir}/libs/_TargetLines.dll"
+
+          object_format="$(objdump -f "${module}")"
+          grep -q 'file format pei-i386' <<<"${object_format}"
+
+          pe_headers="$(objdump -p "${module}")"
+          grep -Eq 'Export Address Table[[:space:]]+00000001' <<<"${pe_headers}"
+          grep -Eq '\[Name Pointer/Ordinal\] Table[[:space:]]+00000001' <<<"${pe_headers}"
+          test "$(grep -c 'luaopen__TargetLines' <<<"${pe_headers}")" -eq 1
+
+          actual_imports="$(printf '%s\n' "${pe_headers}" \
+            | sed -n 's/^[[:space:]]*DLL Name:[[:space:]]*//p' \
+            | tr -d '\r' \
+            | sort)"
+          expected_imports="$(printf '%s\n' KERNEL32.dll msvcrt.dll | sort)"
+          test "${actual_imports}" = "${expected_imports}"
+
+          actual_files="$(find "${package_dir}" -type f \
+            | sed "s#^${package_dir}/##" \
+            | tr '\\' '/' \
+            | sort)"
+          expected_files="$(printf '%s\n' \
+            LICENSE.md \
+            THIRD_PARTY_NOTICES.md \
+            TargetLines.lua \
+            libs/_TargetLines.dll \
+            | sort)"
+          test "${actual_files}" = "${expected_files}"
+
+      - name: Create addon ZIP
+        id: package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $label = if ('${{ github.event_name }}' -eq 'release') {
+              '${{ github.event.release.tag_name }}'
+          } else {
+              'manual-${{ github.run_number }}'
+          }
+
+          $archive = "build/TargetLines-$label.zip"
+          Compress-Archive `
+              -LiteralPath 'build/github-release/TargetLines' `
+              -DestinationPath $archive `
+              -CompressionLevel Optimal
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($archive)
+          try {
+              $entries = $zip.Entries |
+                  Where-Object { -not [string]::IsNullOrEmpty($_.Name) } |
+                  ForEach-Object { $_.FullName.Replace('\', '/') } |
+                  Sort-Object
+          } finally {
+              $zip.Dispose()
+          }
+
+          $expectedEntries = @(
+              'TargetLines/LICENSE.md'
+              'TargetLines/THIRD_PARTY_NOTICES.md'
+              'TargetLines/TargetLines.lua'
+              'TargetLines/libs/_TargetLines.dll'
+          ) | Sort-Object
+
+          if (($entries -join "`n") -ne ($expectedEntries -join "`n")) {
+              throw "Unexpected release ZIP contents: $($entries -join ', ')"
+          }
+
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash
+          "archive=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "artifact_name=TargetLines-$label" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "### Release package`n`n``$archive```n`nSHA-256: ``$hash``" |
+              Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Attach ZIP to published release
+        if: github.event_name == 'release'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload `
+              '${{ github.event.release.tag_name }}' `
+              '${{ steps.package.outputs.archive }}' `
+              --clobber

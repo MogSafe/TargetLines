@@ -1,12 +1,133 @@
 _addon.name = 'TargetLines'
 _addon.author = 'MogSafe'
-_addon.version = '1.1.0'
+_addon.version = '2.0.0-dev'
 _addon.commands = {'targetlines', 'tl'}
 
 config = require('config')
 texts = require('texts')
 local resources = require('resources')
 require('logger')
+
+local addon_path = windower.addon_path:gsub('\\', '/'):gsub('/+$', '')
+package.cpath = addon_path .. '/libs/?.dll;' .. package.cpath
+
+local function concise_native_error(value)
+    local message = tostring(value or 'unknown load error')
+    message = message:match('^([^\r\n]+)') or message
+    return message:gsub('%s+$', '')
+end
+
+local native_module = nil
+local native_load_error = nil
+local native_load_error_detail = nil
+do
+    local loaded, result = pcall(require, '_TargetLines')
+    if loaded and type(result) == 'table' then
+        native_module = result
+    elseif loaded then
+        native_load_error = 'module entry point did not return a Lua table'
+        native_load_error_detail = native_load_error
+    else
+        native_load_error_detail = tostring(result)
+        native_load_error = concise_native_error(result)
+    end
+end
+
+local native_required_functions = {
+    'start',
+    'stop',
+    'status',
+    'bind_state',
+    'replace_state',
+    'version',
+}
+
+if native_module then
+    for _, function_name in ipairs(native_required_functions) do
+        if type(native_module[function_name]) ~= 'function' then
+            native_load_error = 'incompatible module: ' .. function_name .. ' function missing'
+            native_load_error_detail = native_load_error
+            native_module = nil
+            break
+        end
+    end
+end
+
+if native_module then
+    local version_ok, version = pcall(native_module.version)
+    if not version_ok then
+        native_load_error = 'incompatible module: version check failed: ' .. tostring(version)
+        native_load_error_detail = native_load_error
+        native_module = nil
+    elseif not tostring(version):match('^2%.') then
+        native_load_error = 'incompatible module version: ' .. tostring(version)
+        native_load_error_detail = native_load_error
+        native_module = nil
+    end
+end
+
+local function native_status()
+    if not native_module then
+        return 'unavailable: ' .. tostring(native_load_error or 'unknown load error')
+    end
+    if type(native_module.status) ~= 'function' then
+        return 'unavailable: status function missing'
+    end
+
+    local ok, result = pcall(native_module.status)
+    if not ok then
+        return 'error: ' .. tostring(result)
+    end
+    return tostring(result)
+end
+
+local function call_native(function_name)
+    if not native_module then
+        return false, 'unavailable: ' .. tostring(native_load_error or 'unknown load error')
+    end
+
+    local native_function = native_module[function_name]
+    if type(native_function) ~= 'function' then
+        return false, function_name .. ' function missing'
+    end
+
+    local ok, result = pcall(native_function)
+    if not ok then
+        return false, tostring(result)
+    end
+    return true, tostring(result)
+end
+
+local legacy_plugin_path = windower.windower_path .. 'plugins/TargetLines.dll'
+local legacy_plugin_status = 'not_checked'
+local legacy_plugin_backup = nil
+local native_start_pending = false
+local native_start_not_before = 0
+local legacy_unload_sent = false
+local native_start_warning_at = -30
+
+local function file_exists(path)
+    local file = io.open(path, 'rb')
+    if not file then
+        return false
+    end
+    file:close()
+    return true
+end
+
+local function available_legacy_backup_path()
+    local base = legacy_plugin_path .. '.v1-disabled'
+    if not file_exists(base) then
+        return base
+    end
+    for suffix = 2, 20 do
+        local candidate = base .. '-' .. tostring(suffix)
+        if not file_exists(candidate) then
+            return candidate
+        end
+    end
+    return nil
+end
 
 local defaults = {}
 defaults.enabled = true
@@ -139,8 +260,6 @@ config_box.current_string = ''
 config_box:hide()
 local config_visible = false
 
-local state_dir = windower.windower_path .. 'plugins/settings/TargetLines'
-local state_instances_dir = state_dir .. '/instances'
 local state_identifier = nil
 local state_path = nil
 local state_bound = false
@@ -149,7 +268,6 @@ local state_last_error = ''
 local state_last_route_attempt = -1
 local state_last_route_command = -1
 local state_last_warning = -30
-local state_route_retry_interval = 1.0
 local state_route_refresh_interval = 5.0
 local state_warning_interval = 30.0
 local inspect_path = windower.addon_path .. 'inspect.log'
@@ -202,28 +320,6 @@ local native_probe_commands = {
     drawon = true,
     drawoff = true,
 }
-
-local function ensure_state_dirs()
-    if type(windower.create_dir) ~= 'function' or type(windower.dir_exists) ~= 'function' then
-        return false, 'Windower directory functions are unavailable'
-    end
-
-    local paths = {
-        windower.windower_path .. 'plugins/settings',
-        state_dir,
-        state_instances_dir,
-    }
-    for _, path in ipairs(paths) do
-        if not windower.dir_exists(path) then
-            local created, error_message = windower.create_dir(path)
-            if not created and not windower.dir_exists(path) then
-                return false, error_message or ('Could not create ' .. path)
-            end
-        end
-    end
-
-    return true
-end
 
 local slider_rows = {
     {name = 'opacity_scale', command = 'opacity', label = 'opacity'},
@@ -1544,6 +1640,97 @@ append_runtime_log = function(line)
     return written ~= nil
 end
 
+local function start_native_renderer(now)
+    now = now or os.clock()
+    local ok, result = call_native('start')
+    if ok and result:match('^started') then
+        native_start_pending = false
+        native_start_warning_at = -30
+        append_runtime_log('native renderer auto-started: ' .. result)
+        log('TargetLines native ' .. result)
+        return true
+    end
+
+    native_start_pending = true
+    native_start_not_before = now + 1.0
+    if now - native_start_warning_at >= 30 then
+        native_start_warning_at = now
+        warning('TargetLines native start failed: ' .. tostring(result))
+        append_runtime_log('native renderer start failed: ' .. tostring(result))
+    end
+    return false
+end
+
+local function schedule_native_start(now)
+    now = now or os.clock()
+    if not native_module then
+        native_start_pending = false
+        legacy_plugin_status = 'native_unavailable'
+        return false
+    end
+
+    native_start_pending = true
+    if not file_exists(legacy_plugin_path) then
+        if legacy_plugin_status == 'not_checked' then
+            legacy_plugin_status = 'not_present'
+        end
+        native_start_not_before = now
+        return true
+    end
+
+    legacy_plugin_status = 'detected'
+    native_start_not_before = now + 0.75
+    if not legacy_unload_sent then
+        legacy_unload_sent = true
+        windower.send_command('unload targetlines')
+        warning('TargetLines found the legacy Windower plugin. It will be unloaded and preserved as a disabled backup before the v2 renderer starts.')
+        append_runtime_log('legacy plugin detected path=' .. legacy_plugin_path .. '; unload requested')
+    end
+    return true
+end
+
+local function maintain_native_startup(now)
+    now = now or os.clock()
+    if not native_start_pending or not native_module or now < native_start_not_before then
+        return
+    end
+
+    if file_exists(legacy_plugin_path) then
+        local backup_path = available_legacy_backup_path()
+        if not backup_path then
+            legacy_plugin_status = 'blocked_no_backup_name'
+            native_start_not_before = now + 1.0
+            if now - native_start_warning_at >= 30 then
+                native_start_warning_at = now
+                warning('TargetLines could not preserve the legacy plugin: all disabled backup names are occupied. Remove old TargetLines.dll backups, then reload the addon.')
+                append_runtime_log('legacy plugin migration blocked: no backup name available')
+            end
+            return
+        end
+
+        local renamed, rename_error = os.rename(legacy_plugin_path, backup_path)
+        if not renamed then
+            legacy_plugin_status = 'waiting_for_unload'
+            native_start_not_before = now + 0.5
+            if now - native_start_warning_at >= 30 then
+                native_start_warning_at = now
+                warning('TargetLines is waiting for the legacy plugin to unload before enabling v2. Remove "load targetlines" from scripts/init.txt if this continues.')
+                append_runtime_log('legacy plugin rename retry: ' .. tostring(rename_error))
+            end
+            return
+        end
+
+        legacy_plugin_backup = backup_path
+        legacy_plugin_status = 'disabled_backup'
+        native_start_not_before = now + 0.25
+        warning('TargetLines preserved the legacy plugin as ' .. backup_path .. '. Remove the old "load targetlines" startup command; v2 needs only "lua load TargetLines".')
+        append_runtime_log('legacy plugin disabled backup=' .. backup_path)
+        return
+    end
+
+    start_native_renderer(now)
+end
+
 local function debug_value(value)
     local value_type = type(value)
     if value_type == 'string' then
@@ -1976,30 +2163,6 @@ local function current_state_identifier()
     return server_name .. '-' .. character
 end
 
-local function write_state_contents(path, contents)
-    local file, open_error = io.open(path, 'w')
-    if not file then
-        return false, open_error or 'could not open file for writing'
-    end
-
-    local write_ok, write_result, write_error = pcall(file.write, file, contents)
-    local close_ok, close_result, close_error = pcall(file.close, file)
-    if not write_ok then
-        return false, tostring(write_result)
-    end
-    if not write_result then
-        return false, write_error or 'file write failed'
-    end
-    if not close_ok then
-        return false, tostring(close_result)
-    end
-    if not close_result then
-        return false, close_error or 'file close failed'
-    end
-
-    return true
-end
-
 local function report_state_error(message, now)
     now = now or os.clock()
     state_status = 'error'
@@ -2014,18 +2177,33 @@ local function report_state_error(message, now)
 end
 
 local function send_state_route(identifier)
-    windower.send_command('targetlines statefile ' .. (identifier or 'off'))
     state_last_route_command = os.clock()
+    if not native_module then
+        return false, native_load_error or 'native module unavailable'
+    end
+
+    local ok, result = pcall(native_module.bind_state, identifier or 'off')
+    if not ok then
+        return false, tostring(result)
+    end
+    result = tostring(result)
+    if result ~= 'state bound' and result ~= 'state unbound' then
+        return false, result
+    end
+    return true, result
 end
 
-local function release_state_route(remove_file)
-    local old_path = state_path
-    if old_path then
-        write_state_contents(old_path, encode_state({}, {}))
-    end
-    send_state_route(nil)
-    if remove_file and old_path then
-        os.remove(old_path)
+local function release_state_route()
+    if native_module then
+        local empty_state = encode_state({}, {})
+        local ok, result = pcall(native_module.replace_state, empty_state)
+        if not ok or tostring(result) ~= 'state replaced' then
+            append_runtime_log('native state clear failed: ' .. tostring(result))
+        end
+        local unbound, unbind_result = send_state_route(nil)
+        if not unbound then
+            append_runtime_log('native state unbind failed: ' .. tostring(unbind_result))
+        end
     end
 
     state_identifier = nil
@@ -2042,19 +2220,31 @@ local function maintain_state_route(now, force)
     local identifier = current_state_identifier()
     if not identifier then
         if state_identifier then
-            release_state_route(true)
+            release_state_route()
+        elseif not native_module then
+            state_status = 'native_unavailable'
+            state_last_error = native_load_error or 'native module unavailable'
         else
             state_status = 'waiting_for_character'
         end
         return false
     end
 
+    if not native_module then
+        state_identifier = identifier
+        state_path = nil
+        state_bound = false
+        state_status = 'native_unavailable'
+        state_last_error = native_load_error or 'native module unavailable'
+        return false
+    end
+
     if identifier ~= state_identifier then
         if state_identifier then
-            release_state_route(true)
+            release_state_route()
         end
         state_identifier = identifier
-        state_path = state_instances_dir .. '/' .. identifier .. '.json'
+        state_path = nil
         state_bound = false
         state_status = 'initializing'
         state_last_error = ''
@@ -2062,64 +2252,42 @@ local function maintain_state_route(now, force)
         last_signature = ''
     end
 
-    if not state_bound then
-        if not force and state_last_route_attempt >= 0
-            and now - state_last_route_attempt < state_route_retry_interval then
-            return false
-        end
-
-        state_last_route_attempt = now
-        local dirs_ok, dir_error = ensure_state_dirs()
-        if not dirs_ok then
-            report_state_error(dir_error, now)
-            return false
-        end
-
-        local empty_state = encode_state({}, {})
-        local write_ok, write_error = write_state_contents(state_path, empty_state)
-        if not write_ok then
-            report_state_error(('Could not initialize %s: %s'):format(state_path, tostring(write_error)), now)
-            return false
-        end
-
-        last_signature = empty_state
-        send_state_route(state_identifier)
-        state_bound = true
-        state_status = 'bound'
-        state_last_error = ''
-        if append_runtime_log then
-            append_runtime_log('state route bound identifier=' .. state_identifier .. ' path=' .. state_path)
-        end
-        return true
-    end
-
-    if force or state_last_route_command < 0
+    if not state_bound or force or state_last_route_command < 0
         or now - state_last_route_command >= state_route_refresh_interval then
-        send_state_route(state_identifier)
+        state_last_route_attempt = now
+        local route_ok, route_result = send_state_route(state_identifier)
+        if not route_ok then
+            state_bound = false
+            report_state_error('Could not bind native state: ' .. tostring(route_result), now)
+            return false
+        end
+
+        state_bound = true
+        state_status = 'native_bound'
+        state_last_error = ''
+        if last_signature == '' then
+            append_runtime_log('native state route bound identifier=' .. state_identifier)
+        end
     end
     return true
 end
 
 local function write_state(lines, rings)
-    if not state_bound or not state_path then
-        return false
-    end
-
     local state = encode_state(lines, rings)
     if state == last_signature then
         return true
     end
 
-    local write_ok, write_error = write_state_contents(state_path, state)
-    if not write_ok then
-        report_state_error(('Could not write %s: %s'):format(state_path, tostring(write_error)))
-        send_state_route(nil)
-        state_bound = false
-        state_last_route_attempt = os.clock()
-        last_signature = ''
+    if not native_module or not state_bound then
         return false
     end
 
+    local ok, result = pcall(native_module.replace_state, state)
+    if not ok or tostring(result) ~= 'state replaced' then
+        report_state_error('Could not publish native state: ' .. tostring(result))
+        last_signature = ''
+        return false
+    end
     last_signature = state
     return true
 end
@@ -2154,6 +2322,7 @@ end)
 
 windower.register_event('prerender', function()
     local now = os.clock()
+    maintain_native_startup(now)
     local route_ready = maintain_state_route(now, false)
     if not settings.enabled then
         box:hide()
@@ -2192,19 +2361,24 @@ windower.register_event('prerender', function()
 end)
 
 windower.register_event('load', function()
-    send_state_route(nil)
-    maintain_state_route(os.clock(), true)
-    append_runtime_log(('loaded enabled=%s debug=%s state_route=%s state_id=%s')
-        :format(tostring(settings.enabled), tostring(settings.debug), state_status, tostring(state_identifier or 'none')))
+    local now = os.clock()
+    schedule_native_start(now)
+    maintain_native_startup(now)
+    maintain_state_route(now, true)
+    if not native_module then
+        warning('TargetLines native module is unavailable. Rendering is disabled; reinstall addons/TargetLines/libs/_TargetLines.dll. Error: ' .. tostring(native_load_error))
+    end
+    append_runtime_log(('loaded enabled=%s debug=%s state_route=%s state_id=%s native=%s legacy_plugin=%s')
+        :format(tostring(settings.enabled), tostring(settings.debug), state_status,
+            tostring(state_identifier or 'none'), native_status(), legacy_plugin_status))
 end)
 
 windower.register_event('login', function()
-    send_state_route(nil)
     maintain_state_route(os.clock(), true)
 end)
 
 windower.register_event('logout', function()
-    release_state_route(true)
+    release_state_route()
 end)
 
 windower.register_event('zone change', function()
@@ -2569,6 +2743,7 @@ windower.register_event('addon command', function(command, ...)
                 state_status, tostring(state_identifier or 'none'), tostring(state_path or 'none'),
                 tostring(state_last_error ~= '' and state_last_error or 'none'),
                 tostring(#last_lines), tostring(#last_nearby)))
+        log('native=' .. native_status())
         append_runtime_log(('status enabled=%s debug=%s action_debug=%s player=%s party=%s pet=%s enemy=%s other_party=%s special=%s aoe_mode=%s color_blind=%s range=%s global_opacity=%s player_opacity=%s ally_opacity=%s enemy_opacity=%s aoe_opacity=%s fade=%s width=%s glow=%s source_height=%s target_height=%s interval=%s regular=%s repeat_delay=%s special_cooldown=%s claim=%s auto_inspect=%s auto_interval=%s state_route=%s state_id=%s state=%s state_error=%s lines=%s nearby=%s')
             :format(tostring(settings.enabled), tostring(settings.debug), tostring(settings.action_debug),
                 tostring(settings.show_player_lines ~= false), tostring(settings.show_party_lines ~= false),
@@ -2589,20 +2764,37 @@ windower.register_event('addon command', function(command, ...)
                 state_status, tostring(state_identifier or 'none'), tostring(state_path or 'none'),
                 tostring(state_last_error ~= '' and state_last_error or 'none'),
                 tostring(#last_lines), tostring(#last_nearby)))
+    elseif command == 'nativestatus' then
+        log('TargetLines native ' .. native_status()
+            .. ' | legacy_plugin=' .. legacy_plugin_status
+            .. ', legacy_backup=' .. tostring(legacy_plugin_backup or 'none'))
+    elseif command == 'nativestart' or command == 'nativestop' then
+        if command == 'nativestart' then
+            if schedule_native_start(os.clock()) then
+                maintain_native_startup(os.clock())
+                if native_start_pending then
+                    log('TargetLines native start pending; legacy_plugin=' .. legacy_plugin_status)
+                end
+            else
+                warning('TargetLines native unavailable: ' .. tostring(native_load_error))
+            end
+        else
+            native_start_pending = false
+            local ok, result = call_native('stop')
+            if ok then
+                log('TargetLines native ' .. result)
+            else
+                warning('TargetLines native ' .. result)
+            end
+        end
     elseif command == 'inspect' or command == 'i' then
         if write_inspect_log('manual') then
             log('Inspect snapshot written: ' .. inspect_path)
         end
     elseif native_probe_commands[command] then
-        local native_command = command
-        if #args > 0 then
-            native_command = native_command .. ' ' .. table.concat(args, ' ')
-        end
-        windower.send_command('targetlines ' .. native_command)
-        append_runtime_log('native command forwarded via addon alias: ' .. native_command)
-        log('TargetLines native command forwarded: ' .. native_command)
+        warning('TargetLines legacy plugin probe commands are unavailable in v2 native-addon mode.')
     else
-        log('Commands: //tl on | off | config | settings | playerlines [on|off] | partylines [on|off] | petlines [on|off] | enemylines [on|off] | otherpartylines [on|off] | speciallines [on|off] | fanlines [on|off] | aoemode off|fan|ring1|ring2 | aoeopacity <0.1-1.25>|+|- | colorblind [on|off] | regular first|repeat|off | playeropacity +/- | allyopacity +/- | enemyopacity +/- | opacity +/- | fade +/- | width +/- | glow +/- | debug [on|off] | actiondebug [on|off] | sourceheight +/- | targetheight +/- | timeout <sec> | range <yalms> | interval <sec> | cooldown <sec> | specialcooldown <sec> | claim [on|off] | autoinspect [on|off] | autoinspect interval <sec> | boneprobe | luamobprobe | dynamicbone <auto|off|0-255> | clear | status | inspect')
+        log('Commands: //tl on | off | config | settings | playerlines [on|off] | partylines [on|off] | petlines [on|off] | enemylines [on|off] | otherpartylines [on|off] | speciallines [on|off] | fanlines [on|off] | aoemode off|fan|ring1|ring2 | aoeopacity <0.1-1.25>|+|- | colorblind [on|off] | regular first|repeat|off | playeropacity +/- | allyopacity +/- | enemyopacity +/- | opacity +/- | fade +/- | width +/- | glow +/- | debug [on|off] | actiondebug [on|off] | sourceheight +/- | targetheight +/- | timeout <sec> | range <yalms> | interval <sec> | cooldown <sec> | specialcooldown <sec> | claim [on|off] | autoinspect [on|off] | autoinspect interval <sec> | boneprobe | clear | status | nativestatus | nativestart | nativestop | inspect')
     end
 end)
 
@@ -2611,7 +2803,11 @@ windower.register_event('mouse', function(type, x, y, delta, blocked)
 end)
 
 windower.register_event('unload', function()
-    release_state_route(true)
+    native_start_pending = false
+    release_state_route()
+    if native_module and type(native_module.stop) == 'function' then
+        pcall(native_module.stop)
+    end
     box:hide()
     config_box:hide()
 end)
