@@ -5,9 +5,9 @@
 TargetLines is a Windower 4 addon that draws Final Fantasy XII-style target
 lines during combat. Lines show the flow of actions between players, party
 members, trusts, pets, and enemies. Supported area actions can also be shown
-with fan lines or animated rings.
+with various AoE effects.
 
-TargetLines v2 packages its native 3D renderer as a Lua-loaded module inside
+v2 packages its native 3D renderer as a Lua-loaded module inside
 the addon. It does not require a Windower plugin or transient JSON state files.
 
 Maintainer: [MogSafe](https://github.com/MogSafe)
@@ -101,7 +101,7 @@ backups named `Windower/plugins/TargetLines.dll.v1-disabled*` and the unused
   actions draw as they happen.
 - Player, party, trust, pet, enemy, and unrelated-party lines can be controlled
   independently.
-- Area actions support Ring (A), Ring (B), Fan, and Off presentations.
+- Area actions feature 3 selectable styles: Ring (A), Ring (B), Fan, or can be turned Off.
 - Line state is sent directly from Lua to the native renderer in the current
   game process.
 - Each multibox client therefore owns an independent render state without
@@ -136,8 +136,8 @@ styles.
 <img width="720" height="405" alt="TargetLines Ring A indicator" src="https://github.com/user-attachments/assets/df6ef290-403e-48aa-adeb-0f6d849834e3" />
 
 - **Ring (A):** expanding AoE ring with orbiting line target indicators.
-- **Ring (B):** expanding AoE footprint with contracting target indicators.
-- **Fan:** fan-out lines from the action center to each affected target.
+- **Ring (B):** expanding AoE ring with contracting target indicators.
+- **Fan:** fan out lines from the action center to each affected target.
 - **Off:** no AoE indicator; ordinary target lines remain enabled.
 
 Ring (A) is the default for new installations. Choose a style from `AoE Style`
